@@ -1,0 +1,107 @@
+{
+    "indexes": [
+        {
+            "collectionGroup": "shipments",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "voyageId",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "createdAt",
+                    "order": "DESCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "shipments",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "customerId",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "createdAt",
+                    "order": "DESCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "shipments",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "voyageId",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "status",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "createdAt",
+                    "order": "DESCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "shipments",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "voyageId",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "courier",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "createdAt",
+                    "order": "DESCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "voyages",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "status",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "departureDate",
+                    "order": "ASCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "customers",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "isActive",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "name",
+                    "order": "ASCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "customers",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "phoneNormalized",
+                    "order": "ASCENDING"
+                }
+            ]
+        }
+    ],
+    "fieldOverrides": []
+}

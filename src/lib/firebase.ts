@@ -28,17 +28,17 @@ if (isFirebaseConfigured) {
   }
   db = getFirestore(app);
   storage = getStorage(app);
-  
+
   // Enable offline persistence
   try {
     enableIndexedDbPersistence(db, {
       cacheSizeBytes: CACHE_SIZE_UNLIMITED
     }).catch((err) => {
-        if (err.code == 'failed-precondition') {
-            // Multiple tabs open.
-        } else if (err.code == 'unimplemented') {
-            // The current browser does not support all of the features required to enable persistence
-        }
+      if (err.code == 'failed-precondition') {
+        // Multiple tabs open.
+      } else if (err.code == 'unimplemented') {
+        // The current browser does not support all of the features required to enable persistence
+      }
     });
   } catch (error) {
     //
@@ -50,5 +50,11 @@ if (isFirebaseConfigured) {
 
 export { db, storage };
 
+// 기존 CBM Checker 컬렉션
 export const SHIPPER_COLLECTION = 'shippers';
 export const BOX_COLLECTION = 'boxes';
+
+// ERP 시스템 컬렉션
+export const CUSTOMER_COLLECTION = 'customers';    // 고객 마스터 데이터
+export const VOYAGE_COLLECTION = 'voyages';        // 항차 데이터
+export const SHIPMENT_COLLECTION = 'shipments';    // 화물 트랜잭션 데이터
