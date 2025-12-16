@@ -146,25 +146,54 @@ const NewVoyageModal = ({
     onCreate: (data: any) => void;
 }) => {
     const [formData, setFormData] = useState({
-        name: '',
-        departureDate: '',
-        cutoffDate: '',
+        cutoffDate: '',    // 마감일 (먼저 입력)
+        name: '',          // 항차명
+        voyageNumber: '1', // 차수
+        departureDate: '', // 출항일 (마감일 + 5일 자동 계산)
     });
+
+    // 마감일 변경 시 자동 항차명 및 출항일 생성
+    const handleCutoffDateChange = (date: string) => {
+        if (!date) {
+            setFormData(prev => ({ ...prev, cutoffDate: date }));
+            return;
+        }
+
+        // 출항일 = 마감일 + 5일 (기본값)
+        const cutoff = new Date(date);
+        const departure = new Date(cutoff);
+        departure.setDate(departure.getDate() + 5);
+        const departureStr = departure.toISOString().split('T')[0];
+
+        // 자동 항차명 생성: YYYY-MM-DD N차
+        const autoName = `${date} ${formData.voyageNumber}차`;
+
+        setFormData(prev => ({
+            ...prev,
+            cutoffDate: date,
+            departureDate: departureStr,
+            name: autoName,
+        }));
+    };
+
+    // 차수 변경 시 항차명 업데이트
+    const handleVoyageNumberChange = (num: string) => {
+        setFormData(prev => ({
+            ...prev,
+            voyageNumber: num,
+            name: prev.cutoffDate ? `${prev.cutoffDate} ${num}차` : prev.name,
+        }));
+    };
 
     const handleSubmit = () => {
         if (!formData.name || !formData.departureDate || !formData.cutoffDate) return;
-        onCreate(formData);
-        setFormData({ name: '', departureDate: '', cutoffDate: '' });
+        onCreate({
+            name: formData.name,
+            departureDate: formData.departureDate,
+            cutoffDate: formData.cutoffDate,
+        });
+        setFormData({ cutoffDate: '', name: '', voyageNumber: '1', departureDate: '' });
         onClose();
-    };
-
-    // 자동 이름 생성
-    const handleDepartureDateChange = (date: string) => {
-        setFormData(prev => ({
-            ...prev,
-            departureDate: date,
-            name: date ? `${date.replace(/-/g, '-')} 1차` : prev.name,
-        }));
     };
 
     return (
@@ -176,40 +205,75 @@ const NewVoyageModal = ({
                         새 항차 생성
                     </DialogTitle>
                     <DialogDescription>
-                        새로운 선적 일정을 등록합니다.
+                        새로운 선적 일정을 등록합니다. 마감일을 먼저 선택하세요.
                     </DialogDescription>
                 </DialogHeader>
 
                 <div className="space-y-4">
+                    {/* 1. 입고 마감일 (먼저 입력) */}
                     <div>
-                        <Label htmlFor="departureDate">출항일 *</Label>
+                        <Label htmlFor="cutoffDate" className="text-base font-semibold">
+                            ① 입고 마감일 *
+                        </Label>
                         <Input
-                            id="departureDate"
+                            id="cutoffDate"
                             type="date"
-                            value={formData.departureDate}
-                            onChange={(e) => handleDepartureDateChange(e.target.value)}
+                            value={formData.cutoffDate}
+                            onChange={(e) => handleCutoffDateChange(e.target.value)}
+                            className="mt-1"
                         />
+                        <p className="text-xs text-muted-foreground mt-1">
+                            화물 입고 마감 날짜를 선택하세요
+                        </p>
                     </div>
 
+                    {/* 2. 항차명 (자동 생성, 수정 가능) */}
                     <div>
-                        <Label htmlFor="name">항차명 *</Label>
+                        <Label htmlFor="name" className="text-base font-semibold">
+                            ② 항차명 *
+                        </Label>
                         <Input
                             id="name"
                             value={formData.name}
                             onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))}
                             placeholder="2025-12-01 1차"
+                            className="mt-1"
                         />
+                        <p className="text-xs text-muted-foreground mt-1">
+                            마감일 선택 시 자동 생성됩니다
+                        </p>
                     </div>
 
+                    {/* 3. 차수 */}
                     <div>
-                        <Label htmlFor="cutoffDate">입고 마감일 *</Label>
-                        <Input
-                            id="cutoffDate"
-                            type="date"
-                            value={formData.cutoffDate}
-                            onChange={(e) => setFormData(prev => ({ ...prev, cutoffDate: e.target.value }))}
-                        />
+                        <Label htmlFor="voyageNumber" className="text-base font-semibold">
+                            ③ 차수
+                        </Label>
+                        <select
+                            id="voyageNumber"
+                            value={formData.voyageNumber}
+                            onChange={(e) => handleVoyageNumberChange(e.target.value)}
+                            className="mt-1 w-full h-10 px-3 rounded-md border border-input bg-background"
+                        >
+                            <option value="1">1차</option>
+                            <option value="2">2차</option>
+                            <option value="3">3차</option>
+                            <option value="4">4차</option>
+                            <option value="5">5차</option>
+                        </select>
                     </div>
+
+                    {/* 출항일 (자동 계산, 읽기 전용 표시) */}
+                    {formData.departureDate && (
+                        <div className="p-3 bg-muted rounded-md">
+                            <p className="text-sm text-muted-foreground">
+                                <span className="font-medium">출항 예정일:</span> {formData.departureDate}
+                            </p>
+                            <p className="text-xs text-muted-foreground mt-1">
+                                (마감일 + 5일 기준)
+                            </p>
+                        </div>
+                    )}
                 </div>
 
                 <DialogFooter>
@@ -258,6 +322,9 @@ export default function VoyagesPage() {
     // 새 항차 생성 (Firestore 연동)
     const handleCreateVoyage = async (data: any) => {
         setIsCreating(true);
+        console.log('[createVoyage] Input data:', data);
+        console.log('[createVoyage] isFirebaseConfigured:', isFirebaseConfigured);
+
         try {
             const newVoyage: Omit<Voyage, 'id' | 'createdAt' | 'totalShipments' | 'totalCbm' | 'totalAmount'> = {
                 name: data.name,
@@ -266,9 +333,12 @@ export default function VoyagesPage() {
                 cutoffDate: { seconds: new Date(data.cutoffDate).getTime() / 1000, nanoseconds: 0 },
             };
 
+            console.log('[createVoyage] Prepared voyage:', newVoyage);
+
             if (isFirebaseConfigured) {
-                await createVoyage(newVoyage);
-                toast({ title: "생성 완료", description: `${data.name} 항차가 생성되었습니다.` });
+                const voyageId = await createVoyage(newVoyage);
+                console.log('[createVoyage] Firestore created ID:', voyageId);
+                toast({ title: "✅ 생성 완료", description: `${data.name} 항차가 생성되었습니다.` });
             } else {
                 // 로컬 Fallback
                 const localNewVoyage: Voyage = {
@@ -280,11 +350,16 @@ export default function VoyagesPage() {
                     createdAt: { seconds: Date.now() / 1000, nanoseconds: 0 },
                 };
                 setLocalVoyages(prev => [localNewVoyage, ...prev]);
-                toast({ title: "생성 완료 (Demo)", description: `${data.name} 항차가 생성되었습니다.` });
+                toast({ title: "✅ 생성 완료 (Demo)", description: `${data.name} 항차가 생성되었습니다.` });
             }
         } catch (error) {
-            console.error('Create voyage error:', error);
-            toast({ variant: "destructive", title: "생성 실패" });
+            const errorMessage = error instanceof Error ? error.message : '알 수 없는 오류';
+            console.error('[createVoyage] Error:', error);
+            toast({
+                variant: "destructive",
+                title: "❌ 생성 실패",
+                description: errorMessage
+            });
         } finally {
             setIsCreating(false);
         }

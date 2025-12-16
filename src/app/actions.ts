@@ -2,15 +2,15 @@
 "use server";
 
 import {
-  collection,
-  writeBatch,
-  doc,
-  getDocs,
-  query,
-  where,
-  updateDoc,
-  serverTimestamp,
-  addDoc,
+    collection,
+    writeBatch,
+    doc,
+    getDocs,
+    query,
+    where,
+    updateDoc,
+    serverTimestamp,
+    addDoc,
 } from 'firebase/firestore';
 import { ref, deleteObject } from 'firebase/storage';
 import { db, storage, SHIPPER_COLLECTION, BOX_COLLECTION } from '@/lib/firebase';
@@ -23,7 +23,7 @@ import type { Shipper, Box } from '@/types';
  * @returns An object indicating success or failure.
  */
 export async function addShipperAndBoxesAction(
-    shipperData: Omit<Shipper, 'id' | 'createdAt' | 'isUrgent' | 'isConfirmed'>, 
+    shipperData: Omit<Shipper, 'id' | 'createdAt' | 'isUrgent' | 'isConfirmed'>,
     boxCount: number
 ): Promise<{ success: boolean; shipperId?: string; error?: string }> {
     if (!db) {
@@ -36,11 +36,11 @@ export async function addShipperAndBoxesAction(
     try {
         // 1. Create the new shipper document
         const shipperRef = doc(collection(db, SHIPPER_COLLECTION));
-        const shipperPayload = { 
-            ...shipperData, 
+        const shipperPayload = {
+            ...shipperData,
             isUrgent: false,
             isConfirmed: false,
-            createdAt: serverTimestamp() 
+            createdAt: serverTimestamp()
         };
         batch.set(shipperRef, shipperPayload);
 
@@ -127,6 +127,56 @@ export async function updateShipperConfirmationStatusAction(shipperIds: string[]
     }
 }
 
+/**
+ * Updates the 'isArrived' status for a shipper (입고 확인).
+ * @param shipperId The ID of the shipper to update.
+ * @param isArrived The new arrival status.
+ * @returns An object indicating success or failure.
+ */
+export async function updateShipperArrivedStatusAction(shipperId: string, isArrived: boolean): Promise<{ success: boolean; error?: string }> {
+    if (!db) {
+        const errorMsg = "Firebase is not configured correctly.";
+        return { success: false, error: errorMsg };
+    }
+    if (!shipperId) {
+        return { success: false, error: "Shipper ID is required." };
+    }
+
+    try {
+        const shipperRef = doc(db, SHIPPER_COLLECTION, shipperId);
+        await updateDoc(shipperRef, { isArrived });
+        return { success: true };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "An unknown server error occurred.";
+        return { success: false, error: errorMessage };
+    }
+}
+
+/**
+ * Updates the 'isPaid' status for a shipper (결제 확인).
+ * @param shipperId The ID of the shipper to update.
+ * @param isPaid The new payment status.
+ * @returns An object indicating success or failure.
+ */
+export async function updateShipperPaidStatusAction(shipperId: string, isPaid: boolean): Promise<{ success: boolean; error?: string }> {
+    if (!db) {
+        const errorMsg = "Firebase is not configured correctly.";
+        return { success: false, error: errorMsg };
+    }
+    if (!shipperId) {
+        return { success: false, error: "Shipper ID is required." };
+    }
+
+    try {
+        const shipperRef = doc(db, SHIPPER_COLLECTION, shipperId);
+        await updateDoc(shipperRef, { isPaid });
+        return { success: true };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "An unknown server error occurred.";
+        return { success: false, error: errorMessage };
+    }
+}
+
 
 /**
  * Deletes a single shipper and all their associated data (boxes, images).
@@ -204,12 +254,12 @@ export async function deleteMultipleShippersAction(shipperIds: string[]): Promis
     }
 
     let deletedCount = 0;
-    
+
     // We process each shipper deletion sequentially to avoid overwhelming resources and for clearer error tracking.
     for (const shipperId of shipperIds) {
         try {
             const result = await deleteSingleShipperAction(shipperId);
-            if(result.success) {
+            if (result.success) {
                 deletedCount++;
             } else {
                 // Log the error for the specific shipper that failed, but continue with the others.
@@ -222,10 +272,10 @@ export async function deleteMultipleShippersAction(shipperIds: string[]): Promis
     if (deletedCount === shipperIds.length) {
         return { success: true, count: deletedCount };
     } else {
-        return { 
-            success: false, 
-            count: deletedCount, 
-            error: `${shipperIds.length - deletedCount}개 화주 정보 삭제에 실패했습니다. 서버 로그를 확인하세요.` 
+        return {
+            success: false,
+            count: deletedCount,
+            error: `${shipperIds.length - deletedCount}개 화주 정보 삭제에 실패했습니다. 서버 로그를 확인하세요.`
         };
     }
 }
@@ -252,13 +302,13 @@ export async function deleteAllDataAction(): Promise<{ success: boolean; error?:
         boxesSnapshot.forEach(boxDoc => {
             const boxData = boxDoc.data();
             if (boxData.imageUrl) {
-                 const imageRef = ref(storage, boxData.imageUrl);
-                 imageDeletionPromises.push(
+                const imageRef = ref(storage, boxData.imageUrl);
+                imageDeletionPromises.push(
                     deleteObject(imageRef).catch(err => {
                         if (err.code !== 'storage/object-not-found') {
                         }
                     })
-                 );
+                );
             }
             batch.delete(boxDoc.ref);
         });
@@ -268,10 +318,10 @@ export async function deleteAllDataAction(): Promise<{ success: boolean; error?:
         shippersSnapshot.forEach(shipperDoc => {
             batch.delete(shipperDoc.ref);
         });
-        
+
         // Attempt to delete all images.
         await Promise.all(imageDeletionPromises);
-        
+
         // Commit all Firestore deletions.
         await batch.commit();
 

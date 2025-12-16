@@ -12,7 +12,9 @@ export interface Shipper {
   imageUrl?: string | null;
   region?: string; // 지역명
   isUrgent?: boolean; // 긴급 화주 여부
-  isConfirmed?: boolean; // 관리자 확인 여부
+  isConfirmed?: boolean; // 관리자 확인 여부 (CBM 측정 완료)
+  isArrived?: boolean; // 창고 입고 확인 여부
+  isPaid?: boolean; // 결제 완료 여부
   createdAt: Timestamp | { seconds: number, nanoseconds: number };
 }
 
@@ -209,10 +211,16 @@ export interface Shipment {
   voyageId: string;         // ⭐ 소속 항차 ID (필수!)
   customerId: string;       // ⭐ 고객 ID (customers 참조, live lookup용)
 
-  // ⭐⭐⭐ SNAPSHOT: 생성 시점의 불변 고객 정보
+  // 기존 호환성: 고객 정보 직접 필드 (이전 코드 지원)
+  customerName: string;
+  customerPodCode: number;
+  customerPhone?: string;
+  customerRegion?: string;
+  customerAddress?: string;
+
+  // ⭐ SNAPSHOT: 새로운 구조 (선택적, 마이그레이션 중)
   // 📌 인보이스/배송 기록에는 이 값 사용!
-  // 📌 Master DB 변경되어도 과거 데이터 보존!
-  snapshot: CustomerSnapshot;
+  snapshot?: CustomerSnapshot;
 
   // 원본 입력 보존 (감사 로그용)
   rawInput?: string;

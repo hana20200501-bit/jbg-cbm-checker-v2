@@ -2,7 +2,6 @@
 "use client";
 
 import { useRouter } from 'next/navigation';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { HardHat, UserCog } from 'lucide-react';
 
 export type Role = 'manager' | 'worker' | null;
@@ -60,3 +59,5 @@ export default function RoleSelectionPage() {
     </main>
   );
 }
+
+

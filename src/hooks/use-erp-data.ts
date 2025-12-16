@@ -61,6 +61,9 @@ export function useVoyages(statuses?: VoyageStatus[]) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<Error | null>(null);
 
+    // ⭐ statuses 배열 의존성 안정화
+    const statusesKey = statuses ? JSON.stringify(statuses.sort()) : '';
+
     useEffect(() => {
         if (!isFirebaseConfigured) {
             setLoading(false);
@@ -70,17 +73,18 @@ export function useVoyages(statuses?: VoyageStatus[]) {
         setLoading(true);
 
         try {
+            const parsedStatuses = statusesKey ? JSON.parse(statusesKey) : undefined;
             const unsubscribe = subscribeToVoyages((data) => {
                 setVoyages(data);
                 setLoading(false);
-            }, statuses);
+            }, parsedStatuses);
 
             return () => unsubscribe();
         } catch (err) {
             setError(err as Error);
             setLoading(false);
         }
-    }, [statuses]);
+    }, [statusesKey]); // ⭐ 문자열로 안정화된 의존성
 
     return { voyages, loading, error };
 }

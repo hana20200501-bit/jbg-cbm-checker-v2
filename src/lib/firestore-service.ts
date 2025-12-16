@@ -465,12 +465,18 @@ export function subscribeToCustomers(
 
     const q = query(collection(db, CUSTOMER_COLLECTION), ...constraints);
 
-    return onSnapshot(q, (snapshot) => {
-        const customers = snapshot.docs.map(doc =>
-            fromFirestore<Customer>({ id: doc.id, ...doc.data() })
-        );
-        callback(customers);
-    });
+    return onSnapshot(q,
+        (snapshot) => {
+            const customers = snapshot.docs.map(doc =>
+                fromFirestore<Customer>({ id: doc.id, ...doc.data() })
+            );
+            callback(customers);
+        },
+        (error) => {
+            console.error('Customer subscription error:', error);
+            callback([]); // 에러 시 빈 배열 반환
+        }
+    );
 }
 
 /**
@@ -490,12 +496,18 @@ export function subscribeToVoyages(
 
     const q = query(collection(db, VOYAGE_COLLECTION), ...constraints);
 
-    return onSnapshot(q, (snapshot) => {
-        const voyages = snapshot.docs.map(doc =>
-            fromFirestore<Voyage>({ id: doc.id, ...doc.data() })
-        );
-        callback(voyages);
-    });
+    return onSnapshot(q,
+        (snapshot) => {
+            const voyages = snapshot.docs.map(doc =>
+                fromFirestore<Voyage>({ id: doc.id, ...doc.data() })
+            );
+            callback(voyages);
+        },
+        (error) => {
+            console.error('Voyage subscription error:', error);
+            callback([]); // 에러 시 빈 배열 반환
+        }
+    );
 }
 
 /**
@@ -510,10 +522,16 @@ export function subscribeToShipments(
     const shipmentsRef = collection(db, VOYAGE_COLLECTION, voyageId, SHIPMENT_COLLECTION);
     const q = query(shipmentsRef, orderBy('createdAt', 'asc'));
 
-    return onSnapshot(q, (snapshot) => {
-        const shipments = snapshot.docs.map(doc =>
-            fromFirestore<Shipment>({ id: doc.id, ...doc.data() })
-        );
-        callback(shipments);
-    });
+    return onSnapshot(q,
+        (snapshot) => {
+            const shipments = snapshot.docs.map(doc =>
+                fromFirestore<Shipment>({ id: doc.id, ...doc.data() })
+            );
+            callback(shipments);
+        },
+        (error) => {
+            console.error('Shipment subscription error:', error);
+            callback([]); // 에러 시 빈 배열 반환
+        }
+    );
 }

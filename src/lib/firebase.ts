@@ -1,5 +1,5 @@
 import { initializeApp, getApps, FirebaseApp } from 'firebase/app';
-import { getFirestore, Firestore, enableIndexedDbPersistence, CACHE_SIZE_UNLIMITED } from 'firebase/firestore';
+import { getFirestore, Firestore, enableIndexedDbPersistence } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 
 const firebaseConfig = {
@@ -31,9 +31,7 @@ if (isFirebaseConfigured) {
 
   // Enable offline persistence
   try {
-    enableIndexedDbPersistence(db, {
-      cacheSizeBytes: CACHE_SIZE_UNLIMITED
-    }).catch((err) => {
+    enableIndexedDbPersistence(db).catch((err) => {
       if (err.code == 'failed-precondition') {
         // Multiple tabs open.
       } else if (err.code == 'unimplemented') {
