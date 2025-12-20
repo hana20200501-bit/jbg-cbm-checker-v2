@@ -477,61 +477,133 @@ export default function CustomersPage() {
             const lines = data.trim().split('\n');
             const headers = lines[0].split('\t').map(h => h.trim().toLowerCase());
 
-            // 컬럼 매핑 (엑셀 양식에 맞게)
-            const noIdx = headers.findIndex(h => h === 'no' || h === 'no.');
-            const nameIdx = headers.findIndex(h => h.includes('이름') || h === '이 름');
-            const nameEnIdx = headers.findIndex(h => h.includes('eng') || h.includes('영문'));
-            const phoneIdx = headers.findIndex(h => h.includes('contact') || h.includes('연락'));
-            const regionIdx = headers.findIndex(h => h.includes('동네') || h.includes('pod'));
-            const addressIdx = headers.findIndex(h => h.includes('상세') || h.includes('주소'));
-            const discountInfoIdx = headers.findIndex(h => h.includes('할인정보') || h.includes('할인'));
-            const deliveryMemoIdx = headers.findIndex(h => h.includes('배송메모') || h.includes('배송'));
-            const countIdx = headers.findIndex(h => h.includes('이용') || h.includes('횟수'));
-            const amountIdx = headers.findIndex(h => h.includes('누적') || h.includes('금액'));
+            console.log('[handleImport] Headers:', headers);
+
+            // 컬럼 매핑 (엑셀 양식에 맞게 - 유연한 매칭)
+            const noIdx = headers.findIndex(h => h === 'no' || h === 'no.' || h.includes('번호'));
+            const nameIdx = headers.findIndex(h => h.includes('이름') || h === '이 름' || h === '성함');
+            const nameEnIdx = headers.findIndex(h => h.includes('eng') || h.includes('영문') || h.includes('영어'));
+            const phoneIdx = headers.findIndex(h => h.includes('contact') || h.includes('연락') || h.includes('전화') || h.includes('핸드폰'));
+            const podIdx = headers.findIndex(h => h === 'pod' || h.includes('동네') || h.includes('지역'));
+            const homeBatterIdx = headers.findIndex(h => h.includes('홈배터') || h.includes('홈배') || h.includes('carrier'));
+            const addressIdx = headers.findIndex(h => h.includes('상세') || h.includes('주소') || h.includes('address'));
+            const discountInfoIdx = headers.findIndex(h => h.includes('할인정보') || h.includes('할인') || h.includes('discount'));
+            const countIdx = headers.findIndex(h => h.includes('이용') || h.includes('횟수') || h.includes('count'));
+            const amountIdx = headers.findIndex(h => h.includes('누적') || h.includes('금액') || h.includes('amount'));
+            const deliveryPlaceIdx = headers.findIndex(h => h.includes('배송처') || h.includes('배달처') || h.includes('배송'));
+
+            console.log('[handleImport] Column indices:', { noIdx, nameIdx, nameEnIdx, phoneIdx, podIdx, homeBatterIdx, addressIdx });
 
             const newCustomers: Customer[] = [];
+            const errors: string[] = [];
 
             for (let i = 1; i < lines.length; i++) {
                 const cells = lines[i].split('\t');
                 const name = cells[nameIdx]?.trim();
 
-                if (!name) continue;
+                if (!name) {
+                    console.log(`[handleImport] Row ${i}: 이름 없음, 스킵`);
+                    continue;
+                }
 
-                // ⚠️ Document ID = 한글 이름!
-                newCustomers.push({
+                // podCode 파싱 (No. 컬럼 또는 POD 컬럼)
+                let podCode = 0;
+                if (noIdx >= 0 && cells[noIdx]) {
+                    podCode = parseInt(cells[noIdx].replace(/[^\d]/g, '')) || 0;
+                }
+                if (podCode === 0 && podIdx >= 0 && cells[podIdx]) {
+                    podCode = parseInt(cells[podIdx].replace(/[^\d]/g, '')) || 0;
+                }
+                if (podCode === 0) {
+                    podCode = i; // 기본값: 행 번호
+                }
+
+                const customerData: Record<string, any> = {
                     id: name,  // Document ID = 이름!
                     name,
-                    nameEn: cells[nameEnIdx]?.trim() || undefined,
-                    podCode: parseInt(cells[noIdx]) || i,  // No. = POD (필수!)
-                    phone: cells[phoneIdx]?.trim() || '',
-                    region: cells[regionIdx]?.trim() || '',
-                    addressDetail: cells[addressIdx]?.trim() || undefined,
-                    discountInfo: cells[discountInfoIdx]?.trim() || undefined,
-                    deliveryMemo: cells[deliveryMemoIdx]?.trim() || undefined,
+                    podCode,
+                    phone: phoneIdx >= 0 ? cells[phoneIdx]?.trim() || '' : '',
+                    region: podIdx >= 0 ? cells[podIdx]?.trim() || '' : '',
                     stats: {
-                        count: parseInt(cells[countIdx]) || 0,
-                        totalAmount: parseFloat(cells[amountIdx]) || 0,
+                        count: countIdx >= 0 ? parseInt(cells[countIdx]) || 0 : 0,
+                        totalAmount: amountIdx >= 0 ? parseFloat(cells[amountIdx]?.replace(/[^\d.]/g, '')) || 0 : 0,
                         totalCbm: 0,
                     },
                     isActive: true,
                     createdAt: { seconds: Date.now() / 1000, nanoseconds: 0 },
+                };
+
+                // 옵셔널 필드 - 값이 있을 때만 추가 (Firestore는 undefined 허용 안함)
+                const nameEnValue = nameEnIdx >= 0 ? cells[nameEnIdx]?.trim() : '';
+                if (nameEnValue) customerData.nameEn = nameEnValue;
+
+                const homeBatterValue = homeBatterIdx >= 0 ? cells[homeBatterIdx]?.trim() : '';
+                if (homeBatterValue) customerData.homeBatter = homeBatterValue;
+
+                const addressValue = addressIdx >= 0 ? cells[addressIdx]?.trim() : '';
+                if (addressValue) customerData.addressDetail = addressValue;
+
+                const discountValue = discountInfoIdx >= 0 ? cells[discountInfoIdx]?.trim() : '';
+                if (discountValue) customerData.discountInfo = discountValue;
+
+                const deliveryValue = deliveryPlaceIdx >= 0 ? cells[deliveryPlaceIdx]?.trim() : '';
+                if (deliveryValue) customerData.deliveryPlace = deliveryValue;
+
+                newCustomers.push(customerData as Customer);
+            }
+
+            console.log(`[handleImport] Parsed ${newCustomers.length} customers`);
+
+            if (newCustomers.length === 0) {
+                toast({
+                    variant: "destructive",
+                    title: "가져오기 실패",
+                    description: "유효한 데이터가 없습니다. 헤더에 '이름' 컬럼이 있는지 확인하세요.",
+                });
+                return;
+            }
+
+            // 🔥 Firestore에 저장
+            if (isFirebaseConfigured) {
+                let savedCount = 0;
+                for (const customer of newCustomers) {
+                    try {
+                        await saveCustomer(customer);
+                        savedCount++;
+                    } catch (err) {
+                        console.error(`[handleImport] Failed to save: ${customer.name}`, err);
+                        errors.push(customer.name);
+                    }
+                }
+
+                if (errors.length > 0) {
+                    toast({
+                        variant: "destructive",
+                        title: "일부 저장 실패",
+                        description: `${savedCount}명 저장, ${errors.length}명 실패: ${errors.slice(0, 3).join(', ')}...`,
+                    });
+                } else {
+                    toast({
+                        title: "✅ 가져오기 완료",
+                        description: `${savedCount}명의 고객이 Firestore에 저장되었습니다.`,
+                    });
+                }
+            } else {
+                // 로컬 Fallback
+                setLocalCustomers(prev => [...prev, ...newCustomers]);
+                toast({
+                    title: "가져오기 완료 (Demo)",
+                    description: `${newCustomers.length}명의 고객이 등록되었습니다.`,
                 });
             }
 
-            // TODO: Firestore에 저장
-            setCustomers(prev => [...prev, ...newCustomers]);
-
-            toast({
-                title: "가져오기 완료",
-                description: `${newCustomers.length}명의 고객이 등록되었습니다.`,
-            });
-
             setIsImportModalOpen(false);
         } catch (error) {
+            console.error('[handleImport] Error:', error);
             toast({
                 variant: "destructive",
                 title: "가져오기 실패",
-                description: "데이터 형식을 확인해주세요.",
+                description: "데이터 형식을 확인해주세요. 탭으로 구분된 데이터인지 확인하세요.",
             });
         } finally {
             setIsLoading(false);

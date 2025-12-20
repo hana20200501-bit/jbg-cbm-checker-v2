@@ -138,14 +138,16 @@ export interface Customer {
   // 연락처 (엑셀 컬럼: Contact)
   phone: string;            // Contact (연락처)
 
-  // 주소 정보 (엑셀 컬럼: 동네, 상세주소)
+  // 주소 정보 (엑셀 컬럼: 동네, 상세주소, 홈배터)
   region: string;           // 동네 (예: "BKK", "Toul Kork", "Camko")
   addressDetail?: string;   // 상세주소
+  homeBatter?: string;      // 홈배터 (예: "4 Toul fork", "3 Grand Jt")
 
-  // 할인/메모 (엑셀 컬럼: 할인정보, 배송메모)
+  // 할인/메모 (엑셀 컬럼: 할인정보, 배송메모, 배송처)
   discountInfo?: string;    // 할인정보 (예: "선교사할인 10%", "5% 급결제")
   discountPercent?: number; // 자동 계산용 할인율 (%)
   deliveryMemo?: string;    // 배송메모 (예: "항공 1개 가능", "12월에만 30% 할인적용")
+  deliveryPlace?: string;   // 배송처 (예: "항도그 가능 $9", "macro cambodia")
 
   // 통계 (엑셀 컬럼: 이용횟수, 누적금액)
   stats: CustomerStats;

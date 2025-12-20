@@ -97,7 +97,11 @@
             "queryScope": "COLLECTION",
             "fields": [
                 {
-                    "fieldPath": "phoneNormalized",
+                    "fieldPath": "isActive",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "podCode",
                     "order": "ASCENDING"
                 }
             ]
