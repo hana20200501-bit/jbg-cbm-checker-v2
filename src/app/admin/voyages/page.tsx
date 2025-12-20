@@ -301,7 +301,8 @@ export default function VoyagesPage() {
     const [localVoyages, setLocalVoyages] = useState<Voyage[]>(SAMPLE_VOYAGES);
 
     // 실제 사용할 항차 목록
-    const voyages = isFirebaseConfigured && firestoreVoyages.length > 0
+    // Firebase가 구성되어 있으면 항상 Firestore 데이터 사용 (빈 배열이어도)
+    const voyages = isFirebaseConfigured
         ? firestoreVoyages
         : localVoyages;
 

@@ -23,16 +23,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ko" className={`${notoSansKR.variable}`}>
+    <html lang="ko" className={`${notoSansKR.variable}`} suppressHydrationWarning>
       <head>
         <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>" />
       </head>
-      <body className="font-body antialiased">
+      <body className="font-body antialiased" suppressHydrationWarning>
         <FirebaseConfigCheck>
           <div className="min-h-screen flex flex-col">
             <Header />
             <div className="flex-grow">
-                {children}
+              {children}
             </div>
             <footer className="text-center p-4 text-muted-foreground text-sm">
               <p>Jangbogo Express CBM Smart Workboard</p>
