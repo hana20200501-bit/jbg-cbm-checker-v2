@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useMemo, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -34,8 +35,9 @@ import {
 import { useToast } from "@/hooks/use-toast";
 // 🔥 Firestore 연동
 import { useCustomers } from '@/hooks/use-erp-data';
-import { saveCustomer, deactivateCustomer } from '@/lib/firestore-service';
+import { saveCustomer, deactivateCustomer, deactivateCustomers, deactivateAllCustomers, saveCustomersBatch } from '@/lib/firestore-service';
 import { isFirebaseConfigured } from '@/lib/firebase';
+import { CustomerTable } from '@/components/customer/CustomerTable';
 
 // 기본 통계
 const defaultStats: CustomerStats = {
@@ -96,17 +98,22 @@ const SAMPLE_CUSTOMERS: Customer[] = [
 // 고객 카드 컴포넌트
 const CustomerCard = ({
     customer,
+    onView,
     onEdit,
     onDelete
 }: {
     customer: Customer;
+    onView: () => void;  // 📌 NEW: 상세 페이지 이동
     onEdit: () => void;
     onDelete: () => void;
 }) => (
-    <Card className={cn(
-        "hover:shadow-md transition-shadow",
-        !customer.isActive && "opacity-50"
-    )}>
+    <Card
+        className={cn(
+            "hover:shadow-md transition-shadow cursor-pointer",
+            !customer.isActive && "opacity-50"
+        )}
+        onClick={onView}  // 📌 카드 클릭 시 상세 페이지로 이동
+    >
         <CardContent className="p-4">
             <div className="flex justify-between items-start gap-4">
                 <div className="flex-1 min-w-0">
@@ -115,6 +122,10 @@ const CustomerCard = ({
                         <span className="bg-primary/10 text-primary text-xs px-2 py-0.5 rounded-full font-medium">
                             #{customer.podCode}
                         </span>
+                        {/* 📌 Priority Badge */}
+                        {customer.preferences?.priority === 'VIP' && (
+                            <span className="bg-yellow-100 text-yellow-800 text-xs px-2 py-0.5 rounded-full">⭐ VIP</span>
+                        )}
                     </div>
 
                     <div className="space-y-1 text-sm text-muted-foreground">
@@ -152,10 +163,17 @@ const CustomerCard = ({
                             <span className="text-muted-foreground">누적:</span>{' '}
                             <span className="font-semibold">${customer.stats.totalAmount.toLocaleString()}</span>
                         </div>
+                        {/* 📌 미수금 표시 */}
+                        {(customer.financials?.currentCredit ?? 0) > 0 && (
+                            <div className="text-red-600">
+                                <span>미수금:</span>{' '}
+                                <span className="font-semibold">${customer.financials?.currentCredit?.toLocaleString()}</span>
+                            </div>
+                        )}
                     </div>
                 </div>
 
-                <div className="flex flex-col gap-1">
+                <div className="flex flex-col gap-1" onClick={(e) => e.stopPropagation()}>
                     <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onEdit}>
                         <Edit2 className="w-4 h-4" />
                     </Button>
@@ -435,6 +453,7 @@ const CustomerEditModal = ({
 
 export default function CustomersPage() {
     const { toast } = useToast();
+    const router = useRouter();
 
     // 🔥 Firestore 고객 데이터 (실시간 구독)
     const { customers: firestoreCustomers, loading: customersLoading } = useCustomers(false); // false = 비활성 포함
@@ -454,6 +473,10 @@ export default function CustomersPage() {
     const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
     const [isEditModalOpen, setIsEditModalOpen] = useState(false);
     const [customerToDelete, setCustomerToDelete] = useState<Customer | null>(null);
+
+    // 🗑️ 선택삭제 / 전체삭제 상태
+    const [customersToDelete, setCustomersToDelete] = useState<Customer[]>([]);
+    const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
 
     // 필터링된 고객 목록
     const filteredCustomers = useMemo(() => {
@@ -490,7 +513,8 @@ export default function CustomersPage() {
             const discountInfoIdx = headers.findIndex(h => h.includes('할인정보') || h.includes('할인') || h.includes('discount'));
             const countIdx = headers.findIndex(h => h.includes('이용') || h.includes('횟수') || h.includes('count'));
             const amountIdx = headers.findIndex(h => h.includes('누적') || h.includes('금액') || h.includes('amount'));
-            const deliveryPlaceIdx = headers.findIndex(h => h.includes('배송처') || h.includes('배달처') || h.includes('배송'));
+            const deliveryMemoIdx = headers.findIndex(h => h.includes('배송메모') || h.includes('메모') || h.includes('memo'));
+            const deliveryPlaceIdx = headers.findIndex(h => h.includes('배송처') || h.includes('배달처'));
 
             console.log('[handleImport] Column indices:', { noIdx, nameIdx, nameEnIdx, phoneIdx, podIdx, homeBatterIdx, addressIdx });
 
@@ -544,10 +568,22 @@ export default function CustomersPage() {
                 if (addressValue) customerData.addressDetail = addressValue;
 
                 const discountValue = discountInfoIdx >= 0 ? cells[discountInfoIdx]?.trim() : '';
-                if (discountValue) customerData.discountInfo = discountValue;
+                if (discountValue) {
+                    customerData.discountInfo = discountValue;
+                    // 할인율 자동 파싱 (e.g., "10%", "선교사할인 10%")
+                    const percentMatch = discountValue.match(/(\d+)\s*%/);
+                    if (percentMatch) {
+                        customerData.discountPercent = parseInt(percentMatch[1]);
+                    }
+                }
 
-                const deliveryValue = deliveryPlaceIdx >= 0 ? cells[deliveryPlaceIdx]?.trim() : '';
-                if (deliveryValue) customerData.deliveryPlace = deliveryValue;
+                // 배송메모 (테이블에 표시되는 필드!)
+                const deliveryMemoValue = deliveryMemoIdx >= 0 ? cells[deliveryMemoIdx]?.trim() : '';
+                if (deliveryMemoValue) customerData.deliveryMemo = deliveryMemoValue;
+
+                // 배송처 (배송메모와 별도)
+                const deliveryPlaceValue = deliveryPlaceIdx >= 0 ? cells[deliveryPlaceIdx]?.trim() : '';
+                if (deliveryPlaceValue) customerData.deliveryPlace = deliveryPlaceValue;
 
                 newCustomers.push(customerData as Customer);
             }
@@ -563,29 +599,20 @@ export default function CustomersPage() {
                 return;
             }
 
-            // 🔥 Firestore에 저장
+            // 🚀 Firestore에 Batch 저장 (빠른 성능!)
             if (isFirebaseConfigured) {
-                let savedCount = 0;
-                for (const customer of newCustomers) {
-                    try {
-                        await saveCustomer(customer);
-                        savedCount++;
-                    } catch (err) {
-                        console.error(`[handleImport] Failed to save: ${customer.name}`, err);
-                        errors.push(customer.name);
-                    }
-                }
+                const result = await saveCustomersBatch(newCustomers);
 
-                if (errors.length > 0) {
+                if (result.errors.length > 0) {
                     toast({
                         variant: "destructive",
                         title: "일부 저장 실패",
-                        description: `${savedCount}명 저장, ${errors.length}명 실패: ${errors.slice(0, 3).join(', ')}...`,
+                        description: `${result.saved}명 저장, ${result.errors.length}명 실패: ${result.errors.slice(0, 3).join(', ')}...`,
                     });
                 } else {
                     toast({
                         title: "✅ 가져오기 완료",
-                        description: `${savedCount}명의 고객이 Firestore에 저장되었습니다.`,
+                        description: `${result.saved}명의 고객이 Firestore에 저장되었습니다.`,
                     });
                 }
             } else {
@@ -670,6 +697,52 @@ export default function CustomersPage() {
         setCustomerToDelete(null);
     };
 
+    // 🗑️ 선택삭제 핸들러
+    const handleBulkDelete = async () => {
+        if (customersToDelete.length === 0) return;
+
+        setIsLoading(true);
+        try {
+            if (isFirebaseConfigured) {
+                const customerNames = customersToDelete.map(c => c.id);
+                const count = await deactivateCustomers(customerNames);
+                toast({ title: "선택삭제 완료", description: `${count}명의 고객이 비활성화되었습니다.` });
+            } else {
+                const ids = new Set(customersToDelete.map(c => c.id));
+                setLocalCustomers(prev => prev.map(c =>
+                    ids.has(c.id) ? { ...c, isActive: false } : c
+                ));
+                toast({ title: "선택삭제 완료 (Demo)", description: `${customersToDelete.length}명의 고객이 비활성화되었습니다.` });
+            }
+        } catch (error) {
+            console.error('[handleBulkDelete] Error:', error);
+            toast({ variant: "destructive", title: "선택삭제 실패", description: "일부 고객 삭제에 실패했습니다." });
+        } finally {
+            setIsLoading(false);
+            setCustomersToDelete([]);
+        }
+    };
+
+    // 🗑️ 전체삭제 핸들러  
+    const handleDeleteAll = async () => {
+        setIsLoading(true);
+        try {
+            if (isFirebaseConfigured) {
+                const count = await deactivateAllCustomers();
+                toast({ title: "전체삭제 완료", description: `${count}명의 고객이 비활성화되었습니다.` });
+            } else {
+                setLocalCustomers(prev => prev.map(c => ({ ...c, isActive: false })));
+                toast({ title: "전체삭제 완료 (Demo)", description: "모든 고객이 비활성화되었습니다." });
+            }
+        } catch (error) {
+            console.error('[handleDeleteAll] Error:', error);
+            toast({ variant: "destructive", title: "전체삭제 실패" });
+        } finally {
+            setIsLoading(false);
+            setShowDeleteAllConfirm(false);
+        }
+    };
+
     return (
         <main className="container mx-auto p-4 sm:p-6 space-y-6 max-w-6xl">
             {/* 헤더 */}
@@ -679,9 +752,6 @@ export default function CustomersPage() {
                         <Users className="w-6 h-6 text-primary" />
                         고객 DB 관리
                     </h1>
-                    <p className="text-muted-foreground mt-1">
-                        총 {customers.filter(c => c.isActive).length}명의 활성 고객
-                    </p>
                 </div>
 
                 <div className="flex gap-2">
@@ -689,61 +759,20 @@ export default function CustomersPage() {
                         <Upload className="w-4 h-4 mr-2" />
                         엑셀 가져오기
                     </Button>
-                    <Button onClick={() => { setEditingCustomer(null); setIsEditModalOpen(true); }}>
-                        <Plus className="w-4 h-4 mr-2" />
-                        신규 등록
-                    </Button>
                 </div>
             </div>
 
-            {/* 검색 */}
-            <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                <Input
-                    placeholder="이름, 연락처, 지역, TrackPod No.로 검색..."
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                    className="pl-10 h-12"
+            {/* 📌 HIGH-PERFORMANCE CUSTOMER TABLE */}
+            <div className="flex-1 min-h-[600px] border rounded-lg overflow-hidden">
+                <CustomerTable
+                    customers={customers.filter(c => c.isActive)}
+                    onEdit={(customer) => { setEditingCustomer(customer); setIsEditModalOpen(true); }}
+                    onDelete={(customer) => setCustomerToDelete(customer)}
+                    onBulkDelete={(selected) => setCustomersToDelete(selected)}
+                    onDeleteAll={() => setShowDeleteAllConfirm(true)}
+                    isLoading={isLoading || customersLoading}
                 />
-                {searchTerm && (
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8"
-                        onClick={() => setSearchTerm('')}
-                    >
-                        <X className="w-4 h-4" />
-                    </Button>
-                )}
             </div>
-
-            {/* 고객 목록 */}
-            {isLoading ? (
-                <div className="flex justify-center py-12">
-                    <Loader2 className="w-8 h-8 animate-spin text-primary" />
-                </div>
-            ) : filteredCustomers.length === 0 ? (
-                <Card className="p-12 text-center">
-                    <Users className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
-                    <h3 className="font-semibold text-lg">
-                        {searchTerm ? '검색 결과가 없습니다' : '등록된 고객이 없습니다'}
-                    </h3>
-                    <p className="text-muted-foreground mt-2">
-                        {searchTerm ? '다른 검색어를 시도해보세요.' : '엑셀 가져오기 또는 신규 등록을 이용하세요.'}
-                    </p>
-                </Card>
-            ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {filteredCustomers.filter(c => c.isActive).map(customer => (
-                        <CustomerCard
-                            key={customer.id}
-                            customer={customer}
-                            onEdit={() => { setEditingCustomer(customer); setIsEditModalOpen(true); }}
-                            onDelete={() => setCustomerToDelete(customer)}
-                        />
-                    ))}
-                </div>
-            )}
 
             {/* 모달들 */}
             <ExcelImportModal
@@ -771,6 +800,47 @@ export default function CustomersPage() {
                     <AlertDialogFooter>
                         <AlertDialogCancel>취소</AlertDialogCancel>
                         <AlertDialogAction onClick={handleDeleteCustomer}>삭제</AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+
+            {/* 🗑️ 선택삭제 확인 다이얼로그 */}
+            <AlertDialog open={customersToDelete.length > 0} onOpenChange={() => setCustomersToDelete([])}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>{customersToDelete.length}명의 고객을 삭제하시겠습니까?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            선택된 고객들이 비활성화됩니다. 이전 거래 내역은 유지됩니다.
+                            <div className="mt-2 max-h-24 overflow-y-auto text-xs">
+                                {customersToDelete.slice(0, 10).map(c => c.name).join(', ')}
+                                {customersToDelete.length > 10 && ` 외 ${customersToDelete.length - 10}명...`}
+                            </div>
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>취소</AlertDialogCancel>
+                        <AlertDialogAction onClick={handleBulkDelete} className="bg-red-600 hover:bg-red-700">
+                            {customersToDelete.length}명 삭제
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+
+            {/* 🗑️ 전체삭제 확인 다이얼로그 */}
+            <AlertDialog open={showDeleteAllConfirm} onOpenChange={setShowDeleteAllConfirm}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle className="text-red-600">⚠️ 전체 고객을 삭제하시겠습니까?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            현재 활성화된 모든 고객({customers.filter(c => c.isActive).length}명)이 비활성화됩니다.
+                            <span className="block mt-2 font-semibold text-red-500">이 작업은 되돌릴 수 없습니다!</span>
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>취소</AlertDialogCancel>
+                        <AlertDialogAction onClick={handleDeleteAll} className="bg-red-600 hover:bg-red-700">
+                            전체 삭제
+                        </AlertDialogAction>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>

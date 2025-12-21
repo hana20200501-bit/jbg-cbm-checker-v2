@@ -105,6 +105,51 @@ export async function saveCustomer(customer: Omit<Customer, 'createdAt'> & { cre
 }
 
 /**
+ * 🚀 고객 대량 저장 (Batch Write - 500개씩 처리)
+ * Excel Import 용 - 훨씬 빠른 성능
+ */
+export async function saveCustomersBatch(
+    customers: Array<Omit<Customer, 'createdAt'> & { createdAt?: any }>
+): Promise<{ saved: number; errors: string[] }> {
+    if (!db) throw new Error('Firestore not initialized');
+    if (customers.length === 0) return { saved: 0, errors: [] };
+
+    let savedCount = 0;
+    const errors: string[] = [];
+    const batchSize = 500; // Firestore batch limit
+
+    for (let i = 0; i < customers.length; i += batchSize) {
+        const batch = writeBatch(db);
+        const chunk = customers.slice(i, i + batchSize);
+
+        for (const customer of chunk) {
+            try {
+                const docRef = doc(db, CUSTOMER_COLLECTION, customer.name);
+                const { createdAt, ...data } = customer;
+                batch.set(docRef, {
+                    ...data,
+                    id: customer.name,
+                    createdAt: serverTimestamp(),
+                    updatedAt: serverTimestamp(),
+                }, { merge: true }); // merge로 기존 데이터와 병합
+            } catch (err) {
+                errors.push(customer.name);
+            }
+        }
+
+        try {
+            await batch.commit();
+            savedCount += chunk.length - errors.filter(e => chunk.some(c => c.name === e)).length;
+        } catch (err) {
+            console.error('[saveCustomersBatch] Batch commit failed:', err);
+            chunk.forEach(c => errors.push(c.name));
+        }
+    }
+
+    return { saved: savedCount, errors };
+}
+
+/**
  * 고객 조회 (단일)
  */
 export async function getCustomer(customerName: string): Promise<Customer | null> {
@@ -166,6 +211,55 @@ export async function deactivateCustomer(customerName: string): Promise<void> {
         isActive: false,
         updatedAt: serverTimestamp(),
     });
+}
+
+/**
+ * 다중 고객 비활성화 (선택삭제)
+ * Firestore batch 사용 - 최대 500개씩 처리
+ */
+export async function deactivateCustomers(customerNames: string[]): Promise<number> {
+    if (!db) throw new Error('Firestore not initialized');
+    if (customerNames.length === 0) return 0;
+
+    let deactivatedCount = 0;
+    const batchSize = 500; // Firestore batch limit
+
+    for (let i = 0; i < customerNames.length; i += batchSize) {
+        const batch = writeBatch(db);
+        const chunk = customerNames.slice(i, i + batchSize);
+
+        for (const name of chunk) {
+            const docRef = doc(db, CUSTOMER_COLLECTION, name);
+            batch.update(docRef, {
+                isActive: false,
+                updatedAt: serverTimestamp(),
+            });
+        }
+
+        await batch.commit();
+        deactivatedCount += chunk.length;
+    }
+
+    return deactivatedCount;
+}
+
+/**
+ * 모든 활성 고객 비활성화 (전체삭제)
+ */
+export async function deactivateAllCustomers(): Promise<number> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    // 활성 고객 목록 조회
+    const q = query(
+        collection(db, CUSTOMER_COLLECTION),
+        where('isActive', '==', true)
+    );
+    const snapshot = await getDocs(q);
+
+    if (snapshot.empty) return 0;
+
+    const customerNames = snapshot.docs.map(doc => doc.id);
+    return await deactivateCustomers(customerNames);
 }
 
 // =============================================================================
@@ -233,13 +327,18 @@ export async function updateVoyageStatus(voyageId: string, status: VoyageStatus)
     if (!db) throw new Error('Firestore not initialized');
 
     const docRef = doc(db, VOYAGE_COLLECTION, voyageId);
-    const updates: any = { status, updatedAt: serverTimestamp() };
+    const updates: any = {
+        id: voyageId,
+        status,
+        updatedAt: serverTimestamp()
+    };
 
     if (status === 'ARRIVED') {
         updates.arrivalDate = serverTimestamp();
     }
 
-    await updateDoc(docRef, updates);
+    // 📌 setDoc + merge:true -> 문서가 없으면 생성
+    await setDoc(docRef, updates, { merge: true });
 }
 
 /**
@@ -254,12 +353,24 @@ export async function updateVoyageStats(
     if (!db) throw new Error('Firestore not initialized');
 
     const docRef = doc(db, VOYAGE_COLLECTION, voyageId);
-    await updateDoc(docRef, {
+    // 📌 setDoc + merge:true -> 문서가 없으면 생성
+    await setDoc(docRef, {
+        id: voyageId,
         totalShipments: increment(shipmentsDelta),
         totalCbm: increment(cbmDelta),
         totalAmount: increment(amountDelta),
         updatedAt: serverTimestamp(),
-    });
+    }, { merge: true });
+}
+
+/**
+ * 🗑️ 항차 삭제
+ */
+export async function deleteVoyage(voyageId: string): Promise<void> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, VOYAGE_COLLECTION, voyageId);
+    await deleteDoc(docRef);
 }
 
 // =============================================================================
@@ -341,7 +452,7 @@ export async function saveShipmentsBatch(
 
                     // 초기값
                     items: [],
-                    status: 'PENDING' as ShipmentStatus,
+                    status: 'DRAFT' as ShipmentStatus,  // 📌 Import 직후 DRAFT 상태
                     totalCbm: 0,
                     subtotal: 0,
                     discountPercent: (shipment.discountRate || 0) * 100,
@@ -372,12 +483,17 @@ export async function saveShipmentsBatch(
     }
 
     // 항차 통계 업데이트 (별도 트랜잭션)
+    // 📌 setDoc + merge:true 사용 -> 문서가 없으면 생성, 있으면 업데이트
     if (savedCount > 0) {
         const voyageRef = doc(db, VOYAGE_COLLECTION, voyageId);
-        await updateDoc(voyageRef, {
+        await setDoc(voyageRef, {
+            id: voyageId,
+            name: voyageId,  // 기본 이름
+            status: 'READY',
             totalShipments: increment(savedCount),
             updatedAt: serverTimestamp(),
-        });
+            createdAt: serverTimestamp(),  // 새로 생성될 때만 사용됨
+        }, { merge: true });
     }
 
     onProgress?.(100, `완료! ${savedCount}건 저장됨`);
@@ -442,6 +558,71 @@ export async function updateShipmentCbm(
 
     // 항차 통계도 업데이트
     await updateVoyageStats(voyageId, 0, totalCbm, 0);
+}
+
+// =============================================================================
+// 📌 Shipment 승인 (Approval Workflow)
+// =============================================================================
+
+/**
+ * 개별 화물 승인 (DRAFT → APPROVED)
+ */
+export async function approveShipment(shipmentId: string): Promise<void> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+    await updateDoc(docRef, {
+        status: 'APPROVED' as ShipmentStatus,
+        approvedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+    });
+}
+
+/**
+ * 항차의 모든 DRAFT 화물 일괄 승인
+ */
+export async function approveAllShipments(voyageId: string): Promise<number> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    // DRAFT 상태인 화물만 조회
+    const q = query(
+        collection(db, SHIPMENT_COLLECTION),
+        where('voyageId', '==', voyageId),
+        where('status', '==', 'DRAFT')
+    );
+
+    const snapshot = await getDocs(q);
+
+    if (snapshot.empty) return 0;
+
+    // 배치로 일괄 업데이트
+    const batch = writeBatch(db);
+    snapshot.docs.forEach(docSnap => {
+        batch.update(doc(db!, SHIPMENT_COLLECTION, docSnap.id), {
+            status: 'APPROVED' as ShipmentStatus,
+            approvedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+        });
+    });
+
+    await batch.commit();
+    return snapshot.size;
+}
+
+/**
+ * 화물 상태 업데이트 (범용)
+ */
+export async function updateShipmentApprovalStatus(
+    shipmentId: string,
+    status: ShipmentStatus
+): Promise<void> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+    await updateDoc(docRef, {
+        status,
+        updatedAt: serverTimestamp(),
+    });
 }
 
 // =============================================================================
@@ -512,6 +693,7 @@ export function subscribeToVoyages(
 
 /**
  * 특정 항차의 화물 실시간 구독
+ * 📌 Root Collection 사용 (saveShipmentsBatch와 일치)
  */
 export function subscribeToShipments(
     voyageId: string,
@@ -519,8 +701,13 @@ export function subscribeToShipments(
 ) {
     if (!db) throw new Error('Firestore not initialized');
 
-    const shipmentsRef = collection(db, VOYAGE_COLLECTION, voyageId, SHIPMENT_COLLECTION);
-    const q = query(shipmentsRef, orderBy('createdAt', 'asc'));
+    // ⭐ Root Collection에서 voyageId로 필터 (saveShipmentsBatch와 일치)
+    // 📌 인덱스에 맞춰 createdAt DESC 사용
+    const q = query(
+        collection(db, SHIPMENT_COLLECTION),
+        where('voyageId', '==', voyageId),
+        orderBy('createdAt', 'desc')
+    );
 
     return onSnapshot(q,
         (snapshot) => {
@@ -534,4 +721,169 @@ export function subscribeToShipments(
             callback([]); // 에러 시 빈 배열 반환
         }
     );
+}
+
+// =============================================================================
+// 📌 Batch Save Shipments (Atomic Operation)
+// =============================================================================
+
+interface StagingRecordForSave {
+    stagingId: string;
+    matchStatus: 'VERIFIED' | 'NEW_CUSTOMER' | 'UNTRACKED';
+    matchedCustomer: Customer | null;
+    warningFlag?: 'PHONE_MISMATCH' | 'REGION_MISMATCH' | null;
+    raw: {
+        name: string;
+        phone?: string;
+        region?: string;
+        address?: string;
+        quantity?: number;
+    };
+    edited: {
+        name: string;
+        phone?: string;
+        region?: string;
+    };
+    // 확장 필드
+    arrivalDate?: string;
+    courier?: string;
+    weight?: number;
+    nationality?: string;
+    classification?: string;
+    feature?: string;
+    invoice?: string;
+    cargoCategory?: string;
+    cargoDesc?: string;
+    podCode?: number;
+}
+
+/**
+ * 📌 Batch Save Shipments V2 (Staging 레코드용)
+ * 
+ * WriteBatch를 사용하여 모든 화물을 원자적으로 저장합니다.
+ * - 500개 단위로 분할 (Firestore 제한)
+ * - Snapshot 저장 (History Protection)
+ * - Voyage 카운터 업데이트 (Denormalization)
+ * - Audit 필드 포함
+ */
+export async function saveShipmentsBatchV2(
+    records: StagingRecordForSave[],
+    voyageId: string,
+    createdBy?: string
+): Promise<{ savedCount: number; errorCount: number }> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const BATCH_SIZE = 500;
+    let savedCount = 0;
+    let errorCount = 0;
+
+    // 500개씩 분할
+    for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const chunk = records.slice(i, i + BATCH_SIZE);
+        const batch = writeBatch(db);
+
+        for (const record of chunk) {
+            try {
+                // 화물 문서 참조 생성
+                const shipmentsRef = collection(db, VOYAGE_COLLECTION, voyageId, SHIPMENT_COLLECTION);
+                const shipmentRef = doc(shipmentsRef);
+
+                // 📌 Snapshot 생성 (History Protection)
+                const snapshot = record.matchedCustomer ? {
+                    customerName: record.matchedCustomer.name,
+                    customerPhone: record.matchedCustomer.phone || '',
+                    customerAddress: record.matchedCustomer.addressDetail || '',
+                    customerRegion: record.matchedCustomer.region || '',
+                    discountRate: (record.matchedCustomer as any).discountRate || 0,
+                    capturedAt: serverTimestamp(),
+                } : null;
+
+                // 📌 문자열 정제 (Sanitization)
+                const cleanName = sanitizeString(record.edited?.name || record.raw.name);
+                const cleanPhone = sanitizePhone(record.raw.phone);
+
+                // 화물 데이터
+                const shipmentData = {
+                    // 관계
+                    voyageId,
+                    customerId: record.matchedCustomer?.id || null,
+
+                    // Snapshot
+                    snapshot,
+                    customerName: record.matchedCustomer?.name || cleanName,
+                    customerPhone: record.matchedCustomer?.phone || cleanPhone,
+                    customerRegion: record.matchedCustomer?.region || record.raw.region || '',
+
+                    // Raw Excel 데이터
+                    rawName: record.raw.name,
+                    qty: record.raw.quantity || 1,
+                    weight: record.weight || 0,
+                    nationality: record.nationality || '',
+                    classification: record.classification || '',
+                    arrivalDate: record.arrivalDate || '',
+                    courier: record.courier || '',
+                    feature: record.feature || '',
+                    invoice: record.invoice || '',
+                    cargoCategory: record.cargoCategory || '',
+                    cargoDesc: record.cargoDesc || '',
+                    podCode: record.podCode || 0,
+
+                    // 상태
+                    status: 'PENDING' as ShipmentStatus,
+                    warningFlag: record.warningFlag || null,
+
+                    // Audit 필드
+                    originalRawRow: JSON.stringify(record.raw),
+                    createdAt: serverTimestamp(),
+                    createdBy: createdBy || 'unknown',
+
+                    // Soft Delete 기본값
+                    deleted: false,
+                };
+
+                batch.set(shipmentRef, shipmentData);
+                savedCount++;
+            } catch (error) {
+                console.error('Error preparing shipment:', error);
+                errorCount++;
+            }
+        }
+
+        // 📌 Voyage 카운터 업데이트 (Denormalization)
+        if (savedCount > 0) {
+            const voyageRef = doc(db, VOYAGE_COLLECTION, voyageId);
+            batch.update(voyageRef, {
+                totalShipments: increment(chunk.length),
+                updatedAt: serverTimestamp(),
+            });
+        }
+
+        // Batch Commit
+        await batch.commit();
+    }
+
+    return { savedCount, errorCount };
+}
+
+// =============================================================================
+// 유틸리티 함수
+// =============================================================================
+
+/**
+ * 문자열 정제 (trim + 보이지 않는 문자 제거)
+ */
+function sanitizeString(str: string | undefined): string {
+    if (!str) return '';
+    return str
+        .trim()
+        .replace(/[\u200B-\u200D\uFEFF]/g, '') // Zero-width 문자 제거
+        .replace(/\s+/g, ' ');                  // 연속 공백 정리
+}
+
+/**
+ * 전화번호 정규화 (숫자만)
+ */
+function sanitizePhone(phone: string | undefined): string {
+    if (!phone) return '';
+    return phone.replace(/[^0-9+]/g, '');
 }

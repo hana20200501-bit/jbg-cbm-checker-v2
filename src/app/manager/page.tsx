@@ -1,10 +1,11 @@
 
 "use client";
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import type { ShipperWithBoxData } from '@/types';
+import type { ShipperWithBoxData, Voyage } from '@/types';
 import { useShippers } from '@/hooks/use-shippers';
+import { useVoyages } from '@/hooks/use-erp-data';
 import { Button } from '@/components/ui/button';
 import { PlusCircle, ClipboardList, Download, Trash2, Loader2, ServerCrash, ArrowUp, ArrowDown, Search, Eye, FilePenLine, Image as ImageIcon, Flame, CheckCircle, Settings, ChevronDown, Users, Ship, FileText, PackageCheck, Receipt, Banknote, MapPin } from 'lucide-react';
 import NewShipperForm from '@/components/manager/new-shipper-form';
@@ -40,6 +41,24 @@ export default function ManagerDashboardPage() {
   const router = useRouter();
   const { shippers, isLoading, error } = useShippers();
   const { toast } = useToast();
+
+  // 🆕 항차 관리
+  const { voyages, loading: voyagesLoading } = useVoyages(['READY', 'CLOSING', 'CLOSED']);
+  const [activeVoyageId, setActiveVoyageId] = useState<string | null>(null);
+
+  // 📌 sessionStorage에서 활성 항차 복원 & 저장
+  useEffect(() => {
+    const saved = sessionStorage.getItem('activeVoyageId');
+    if (saved) setActiveVoyageId(saved);
+  }, []);
+
+  useEffect(() => {
+    if (activeVoyageId) {
+      sessionStorage.setItem('activeVoyageId', activeVoyageId);
+    }
+  }, [activeVoyageId]);
+
+  const activeVoyage = voyages.find(v => v.id === activeVoyageId);
 
   const [isNewShipperModalOpen, setIsNewShipperModalOpen] = useState(false);
   const [isBulkImportModalOpen, setIsBulkImportModalOpen] = useState(false);
@@ -606,6 +625,61 @@ export default function ManagerDashboardPage() {
         <div className="mb-6">
           <StatsCards shippers={shippers} isLoading={isLoading} error={error} />
         </div>
+
+        {/* 🆕 활성 항차 선택 (ERP 연동) */}
+        <Card className="mb-6 p-4 border-2 border-primary/30 bg-primary/5">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <Ship className="w-6 h-6 text-primary" />
+              <div>
+                <h3 className="font-bold text-lg">활성 항차</h3>
+                <p className="text-sm text-muted-foreground">
+                  {activeVoyage ? `${activeVoyage.name} (${activeVoyage.status})` : '항차를 선택하세요'}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <Select value={activeVoyageId || ''} onValueChange={(v) => setActiveVoyageId(v)}>
+                <SelectTrigger className="w-full sm:w-[200px]">
+                  <SelectValue placeholder="항차 선택..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {voyagesLoading ? (
+                    <SelectItem value="loading" disabled>로딩 중...</SelectItem>
+                  ) : voyages.length === 0 ? (
+                    <SelectItem value="none" disabled>등록된 항차 없음</SelectItem>
+                  ) : (
+                    voyages.map(v => (
+                      <SelectItem key={v.id} value={v.id}>
+                        {v.name} ({v.status})
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+              {activeVoyageId && (
+                <>
+                  <Button
+                    onClick={() => router.push(`/admin/voyages/${encodeURIComponent(activeVoyageId)}`)}
+                    variant="outline"
+                    size="sm"
+                  >
+                    <FileText className="w-4 h-4 mr-1" />
+                    상세
+                  </Button>
+                  <Button
+                    onClick={() => router.push('/worker/cbm')}
+                    className="bg-blue-600 hover:bg-blue-700"
+                    size="sm"
+                  >
+                    <PackageCheck className="w-4 h-4 mr-1" />
+                    CBM 측정
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        </Card>
 
         <div className="p-4 bg-muted/80 rounded-lg border">
           <div className="text-sm text-muted-foreground mb-4 p-2 bg-background/70 rounded-md">

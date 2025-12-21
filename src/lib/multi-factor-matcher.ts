@@ -127,12 +127,12 @@ export function performMultiFactorMatch(
         const factors: MatchFactor[] = [];
         let score = 0;
 
-        // 1. 전화번호 매칭 (최우선!)
+        // 1. 전화번호 매칭 (정확 일치만!)
         const customerPhone = normalizePhone(customer.phone);
+        // 📌 부분 일치가 아닌 정확 일치로 변경 (잘못된 매칭 방지)
         const phoneMatch = normalizedInputPhone.length >= 8 &&
             customerPhone.length >= 8 &&
-            (customerPhone.includes(normalizedInputPhone) ||
-                normalizedInputPhone.includes(customerPhone));
+            customerPhone === normalizedInputPhone;
 
         if (phoneMatch) {
             factors.push('PHONE_MATCH');
@@ -145,7 +145,7 @@ export function performMultiFactorMatch(
         if (nameScore === 1) {
             factors.push('EXACT_NAME');
             score = Math.max(score, 1.0);
-        } else if (nameScore >= 0.7) {
+        } else if (nameScore >= 0.85) {  // 📌 85% 이상만 유사 매칭 (기존 70%)
             factors.push('FUZZY_NAME');
             score = Math.max(score, nameScore * 0.9);
         }

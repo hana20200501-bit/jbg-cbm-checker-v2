@@ -88,6 +88,9 @@ export interface Voyage {
   totalCbm: number;             // 총 CBM
   totalAmount: number;          // 총 금액
 
+  // 작업자 공개 설정
+  isVisibleToWorker?: boolean;  // 작업자에게 보이기 여부 (기본: false)
+
   // 메타데이터
   createdAt: Timestamp | { seconds: number; nanoseconds: number };
   updatedAt?: Timestamp | { seconds: number; nanoseconds: number };
@@ -96,13 +99,17 @@ export interface Voyage {
 
 /**
  * 배송 상태 (Shipment Status)
+ * 📌 워크플로우: DRAFT → APPROVED → PENDING → CBM_DONE → INVOICED → PAID → DELIVERED
  */
 export type ShipmentStatus =
-  | 'Pending'     // 입고 완료, 측정 대기
-  | 'Measured'    // CBM 측정 완료
-  | 'Invoiced'    // 인보이스 발행 완료
-  | 'Shipped'     // 배송 중
-  | 'Delivered';  // 배송 완료
+  | 'DRAFT'       // 📌 NEW: Import 직후 (관리자 검토 필요)
+  | 'APPROVED'    // 📌 NEW: 승인됨 (CBM 측정 가능)
+  | 'PENDING'     // CBM 측정 대기 (구 Pending)
+  | 'CBM_DONE'    // CBM 측정 완료 (구 Measured)
+  | 'INVOICED'    // 인보이스 발행 완료
+  | 'PAID'        // 결제 완료
+  | 'DELIVERED'   // 배송 완료
+  | 'CANCELLED';  // 취소됨
 
 /**
  * 고객 통계 (Customer Statistics)
@@ -151,6 +158,25 @@ export interface Customer {
 
   // 통계 (엑셀 컬럼: 이용횟수, 누적금액)
   stats: CustomerStats;
+
+  // ========================================================================
+  // 📌 NEW: Preferences & Admin Notes (Customer 360)
+  // ========================================================================
+  preferences?: {
+    frequentCourier?: string;    // 자주 사용하는 택배사
+    memo?: string;               // 관리자 비공개 메모 (VIP 고객 노트 등)
+    priority?: 'VIP' | 'NORMAL' | 'WATCH';  // 고객 우선순위
+  };
+
+  // ========================================================================
+  // 📌 NEW: Financial Pipeline Data (Customer 360)
+  // ========================================================================
+  financials?: {
+    currentCredit?: number;      // 현재 미수금 (USD)
+    unpaidInvoices?: number;     // 미결제 인보이스 수
+    lastPaymentDate?: Timestamp | { seconds: number; nanoseconds: number };
+    creditLimit?: number;        // 신용 한도 (USD)
+  };
 
   // 메타데이터
   isActive: boolean;        // 활성 여부 (삭제 대신 비활성화)
@@ -211,30 +237,57 @@ export interface Shipment {
 
   // 🔗 필수 관계
   voyageId: string;         // ⭐ 소속 항차 ID (필수!)
-  customerId: string;       // ⭐ 고객 ID (customers 참조, live lookup용)
+  customerId: string | null; // ⭐ 고객 ID (null = UNTRACKED)
+
+  // ========================================================================
+  // 📌 SNAPSHOT: 저장 시점의 고객 정보 (History Protection)
+  // 📌 고객이 주소를 변경해도 기존 인보이스는 변하지 않음!
+  // ========================================================================
+  snapshot: {
+    customerName: string;
+    customerPhone: string;
+    customerAddress: string;
+    customerRegion: string;
+    discountRate: number;
+    capturedAt: Timestamp | { seconds: number; nanoseconds: number };
+  } | null;
 
   // 기존 호환성: 고객 정보 직접 필드 (이전 코드 지원)
   customerName: string;
-  customerPodCode: number;
+  customerPodCode?: number;
   customerPhone?: string;
   customerRegion?: string;
   customerAddress?: string;
 
-  // ⭐ SNAPSHOT: 새로운 구조 (선택적, 마이그레이션 중)
-  // 📌 인보이스/배송 기록에는 이 값 사용!
-  snapshot?: CustomerSnapshot;
+  // ========================================================================
+  // 📌 원본 Excel 데이터 (Full Archiving)
+  // ========================================================================
+  arrivalDate?: string;       // 입고일짜
+  courier?: string;           // 택배사
+  rawName: string;            // 수령인 이름 (내용)
+  qty: number;                // 수량(BOX)
+  weight?: number;            // 중량(KG)
+  nationality?: string;       // 국적 (k/c)
+  classification?: string;    // 분류 (customer/agency)
+  feature?: string;           // 특징
+  invoice?: string;           // 송장
+  cargoCategory?: string;     // 카테고리
+  cargoDesc?: string;         // 화물 설명
+  podCode?: number;           // No. 컬럼 (엑셀 순번)
 
-  // 원본 입력 보존 (감사 로그용)
-  rawInput?: string;
+  // 📌 경고 플래그 (매칭 시 불일치 표시용)
+  warningFlag?: 'PHONE_MISMATCH' | 'REGION_MISMATCH' | null;
 
-  // 화물 정보
-  courier?: string;         // 택배사
-  quantity?: number;        // 박스 수량
-  weight?: number;          // 중량 (kg)
+  // ========================================================================
+  // 📌 AUDIT FIELDS: 추적 및 디버깅용
+  // ========================================================================
+  originalRawRow?: string;    // 원본 Excel 행 JSON (디버깅용)
+  validationErrors?: string[]; // 검증 에러 목록
+  hasError?: boolean;         // 에러 상태 플래그
 
   // CBM 측정 데이터
-  totalCbm?: number;        // 측정된 CBM
-  boxDimensions?: {         // 박스 치수 기록
+  totalCbm?: number;
+  boxDimensions?: {
     length: number;
     width: number;
     height: number;
@@ -242,21 +295,21 @@ export interface Shipment {
   }[];
 
   // 인보이스 항목
-  items: InvoiceItem[];
+  items?: InvoiceItem[];
 
-  // 금액 계산 (기존 호환)
-  subtotal: number;         // 소계
-  discountPercent: number;  // 할인율 (%)
-  discountAmount: number;   // 할인 금액
-  shippingFee: number;      // 배송료
-  packingFee: number;       // 포장비
-  customsFee: number;       // 통관비
-  otherFee: number;         // 기타 비용
-  totalAmount: number;      // 최종 금액
+  // 금액 계산
+  subtotal?: number;
+  discountPercent?: number;
+  discountAmount?: number;
+  shippingFee?: number;
+  packingFee?: number;
+  customsFee?: number;
+  otherFee?: number;
+  totalAmount?: number;
 
   // 결제 정보
-  currency: 'USD' | 'KRW' | 'KHR';
-  isPaid: boolean;
+  currency?: 'USD' | 'KRW' | 'KHR';
+  isPaid?: boolean;
   paidAt?: Timestamp | { seconds: number; nanoseconds: number };
   paymentMethod?: 'Cash' | 'Bank' | 'Card' | 'Other';
 
@@ -264,16 +317,25 @@ export interface Shipment {
   status: ShipmentStatus;
 
   // 인보이스 정보
-  invoiceNumber?: string;   // 인보이스 번호 (예: "JBG-2024-0001")
-  invoicePdfUrl?: string;   // 생성된 PDF URL
+  invoiceNumber?: string;
+  invoicePdfUrl?: string;
 
   // 메모
   memo?: string;
 
-  // 메타데이터
+  // ========================================================================
+  // 📌 SOFT DELETE: 삭제 시 즉시 삭제하지 않음 (Safety Net)
+  // ========================================================================
+  deleted?: boolean;
+  deletedAt?: Timestamp | { seconds: number; nanoseconds: number };
+  deletedBy?: string;
+
+  // ========================================================================
+  // 📌 메타데이터 (Audit)
+  // ========================================================================
   createdAt: Timestamp | { seconds: number; nanoseconds: number };
   updatedAt?: Timestamp | { seconds: number; nanoseconds: number };
-  createdBy?: string;
+  createdBy?: string;           // Admin UID
 }
 
 /**
@@ -325,20 +387,16 @@ export interface BankInfo {
 // =============================================================================
 
 /**
- * 매칭 상태 (Match Status)
+ * 매칭 상태 (Match Status) - Exact Match Only Policy
  * 
- * VERIFIED: 정확히 일치 (name + podCode 모두 매칭)
- * CONFLICT: 이름은 일치하나 데이터(주소/연락처)가 다름
- * SIMILAR: 유사한 이름 발견 (Levenshtein distance 기반)
- * NEW_CUSTOMER: 해당하는 고객 없음 (신규 등록 필요)
- * DUPLICATE: 동일 데이터가 이미 Staging에 존재
+ * VERIFIED: 이름 정확 일치 (고객 DB와 연결됨)
+ * NEW_CUSTOMER: 매칭되는 고객 없음 (신규 등록 필요)
+ * UNTRACKED: 필터 외 항목 (저장되지만 매칭 안함)
  */
 export type MatchStatus =
-  | 'VERIFIED'      // ✅ 완벽 매칭
-  | 'CONFLICT'      // ⚠️ 데이터 충돌
-  | 'SIMILAR'       // 🔍 유사 매칭 검토 필요
+  | 'VERIFIED'      // ✅ 이름 정확 일치
   | 'NEW_CUSTOMER'  // ➕ 신규 고객
-  | 'DUPLICATE';    // ⚡ 중복 항목
+  | 'UNTRACKED';    // ⏸️ 필터 외 항목
 
 /**
  * 충돌 유형 (Conflict Type)
@@ -400,20 +458,29 @@ export interface StagingRecord {
   matchedCustomer: Customer | null;
   similarCandidates: SimilarCandidate[];
 
-  // 충돌 정보 (CONFLICT 상태일 때만)
-  conflict?: {
-    type: ConflictType;
-    fields: {
-      field: string;
-      masterValue: string;
-      importedValue: string;
-    }[];
-    resolution: ConflictResolution;
-  };
+  // ========================================================================
+  // 📌 Visual Diff: 불일치 표시용
+  // ========================================================================
+  warningFlag?: 'PHONE_MISMATCH' | 'REGION_MISMATCH' | null;
+  phoneMismatch?: boolean;    // 전화번호 불일치 (빨간색 표시용)
+  regionMismatch?: boolean;   // 지역 불일치
+
+  // ========================================================================
+  // 📌 Error State: 파싱/검증 에러
+  // ========================================================================
+  parseError?: string;        // 파싱 에러 메시지
+  hasError?: boolean;         // 에러 플래그
+  validationErrors?: string[]; // 검증 에러 목록
+
+  // ========================================================================
+  // 📌 Inline Editing 상태
+  // ========================================================================
+  isEditing?: boolean;
+  editField?: 'name' | 'qty' | 'note';
 
   // 선택 상태
   isSelected: boolean;
-  isResolved: boolean;        // 충돌 해결 여부
+  isResolved: boolean;        // 매칭 완료 여부
 
   // 타임스탬프
   createdAt: number;
@@ -430,14 +497,12 @@ export interface StagingSession {
   // 레코드
   records: StagingRecord[];
 
-  // 통계
+  // 통계 (Exact Match Only - 단순화)
   stats: {
     total: number;
     verified: number;
-    conflict: number;
-    similar: number;
     newCustomer: number;
-    duplicate: number;
+    untracked: number;
   };
 
   // 메타

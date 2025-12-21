@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
     Ship, Plus, Calendar, Package, DollarSign,
-    ChevronRight, Loader2, Search, Filter
+    ChevronRight, Loader2, Search, Filter, Trash2
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Voyage, VoyageStatus } from '@/types';
@@ -20,10 +20,20 @@ import {
     DialogHeader,
     DialogTitle,
 } from "@/components/ui/dialog";
+import {
+    AlertDialog,
+    AlertDialogAction,
+    AlertDialogCancel,
+    AlertDialogContent,
+    AlertDialogDescription,
+    AlertDialogFooter,
+    AlertDialogHeader,
+    AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 // Firestore 연동
 import { useVoyages } from '@/hooks/use-erp-data';
-import { createVoyage } from '@/lib/firestore-service';
+import { createVoyage, deleteVoyage } from '@/lib/firestore-service';
 import { isFirebaseConfigured } from '@/lib/firebase';
 
 // 상태별 스타일
@@ -74,14 +84,30 @@ const SAMPLE_VOYAGES: Voyage[] = [
 ];
 
 // Voyage 카드 컴포넌트
-const VoyageCard = ({ voyage }: { voyage: Voyage }) => {
+const VoyageCard = ({ voyage, onDelete }: { voyage: Voyage; onDelete?: (voyage: Voyage) => void }) => {
     const status = STATUS_STYLES[voyage.status];
     const departureDate = new Date(voyage.departureDate.seconds * 1000);
     const cutoffDate = new Date(voyage.cutoffDate.seconds * 1000);
 
     return (
-        <Link href={`/admin/voyages/${voyage.id}`}>
-            <Card className="hover:shadow-lg transition-all cursor-pointer group">
+        <Card className="hover:shadow-lg transition-all cursor-pointer group relative">
+            {/* 삭제 버튼 */}
+            {onDelete && (
+                <Button
+                    variant="ghost"
+                    size="icon"
+                    className="absolute top-2 right-2 h-8 w-8 text-gray-400 hover:text-red-500 hover:bg-red-50 z-10"
+                    onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onDelete(voyage);
+                    }}
+                >
+                    <Trash2 className="w-4 h-4" />
+                </Button>
+            )}
+
+            <Link href={`/admin/voyages/${voyage.id}`}>
                 <CardContent className="p-5">
                     {/* 헤더 */}
                     <div className="flex items-center justify-between mb-4">
@@ -130,8 +156,8 @@ const VoyageCard = ({ voyage }: { voyage: Voyage }) => {
                         </div>
                     </div>
                 </CardContent>
-            </Card>
-        </Link>
+            </Link>
+        </Card>
     );
 };
 
@@ -249,18 +275,16 @@ const NewVoyageModal = ({
                         <Label htmlFor="voyageNumber" className="text-base font-semibold">
                             ③ 차수
                         </Label>
-                        <select
+                        <Input
                             id="voyageNumber"
                             value={formData.voyageNumber}
                             onChange={(e) => handleVoyageNumberChange(e.target.value)}
-                            className="mt-1 w-full h-10 px-3 rounded-md border border-input bg-background"
-                        >
-                            <option value="1">1차</option>
-                            <option value="2">2차</option>
-                            <option value="3">3차</option>
-                            <option value="4">4차</option>
-                            <option value="5">5차</option>
-                        </select>
+                            placeholder="1"
+                            className="mt-1"
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">
+                            항차 번호를 입력하세요 (예: 1, 2, 3...)
+                        </p>
                     </div>
 
                     {/* 출항일 (자동 계산, 읽기 전용 표시) */}
@@ -307,15 +331,22 @@ export default function VoyagesPage() {
         : localVoyages;
 
     const [searchTerm, setSearchTerm] = useState('');
-    const [statusFilter, setStatusFilter] = useState<VoyageStatus | 'ALL'>('ALL');
+    const [statusFilter, setStatusFilter] = useState<'ALL' | 'READY' | 'ARRIVED'>('ALL');
     const [isNewModalOpen, setIsNewModalOpen] = useState(false);
     const [isCreating, setIsCreating] = useState(false);
+    const [voyageToDelete, setVoyageToDelete] = useState<Voyage | null>(null);
 
-    // 필터링된 항차 목록
+    // 필터링된 항차 목록 (준비중 = READY/CLOSING/CLOSED/SAILING, 완료 = ARRIVED)
     const filteredVoyages = useMemo(() => {
         return voyages.filter(v => {
             const matchesSearch = v.name.toLowerCase().includes(searchTerm.toLowerCase());
-            const matchesStatus = statusFilter === 'ALL' || v.status === statusFilter;
+            let matchesStatus = true;
+            if (statusFilter === 'READY') {
+                // 준비중 = ARRIVED 이외 모두
+                matchesStatus = v.status !== 'ARRIVED';
+            } else if (statusFilter === 'ARRIVED') {
+                matchesStatus = v.status === 'ARRIVED';
+            }
             return matchesSearch && matchesStatus;
         });
     }, [voyages, searchTerm, statusFilter]);
@@ -366,6 +397,25 @@ export default function VoyagesPage() {
         }
     };
 
+    // 항차 삭제 핸들러
+    const handleDeleteVoyage = async () => {
+        if (!voyageToDelete) return;
+
+        try {
+            if (isFirebaseConfigured) {
+                await deleteVoyage(voyageToDelete.id);
+                toast({ title: "삭제 완료", description: `${voyageToDelete.name} 항차가 삭제되었습니다.` });
+            } else {
+                setLocalVoyages(prev => prev.filter(v => v.id !== voyageToDelete.id));
+                toast({ title: "삭제 완료 (Demo)", description: `${voyageToDelete.name} 항차가 삭제되었습니다.` });
+            }
+        } catch (error) {
+            console.error('[deleteVoyage] Error:', error);
+            toast({ variant: "destructive", title: "삭제 실패" });
+        }
+        setVoyageToDelete(null);
+    };
+
     return (
         <div className="p-6 space-y-6">
             {/* 헤더 */}
@@ -404,17 +454,22 @@ export default function VoyagesPage() {
                     >
                         전체
                     </Button>
-                    {(Object.keys(STATUS_STYLES) as VoyageStatus[]).map((status) => (
-                        <Button
-                            key={status}
-                            variant={statusFilter === status ? 'default' : 'outline'}
-                            size="sm"
-                            onClick={() => setStatusFilter(status)}
-                            className={statusFilter === status ? '' : cn(STATUS_STYLES[status].text)}
-                        >
-                            {STATUS_STYLES[status].label}
-                        </Button>
-                    ))}
+                    <Button
+                        variant={statusFilter === 'READY' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setStatusFilter('READY')}
+                        className={statusFilter === 'READY' ? '' : 'text-blue-600'}
+                    >
+                        준비중
+                    </Button>
+                    <Button
+                        variant={statusFilter === 'ARRIVED' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setStatusFilter('ARRIVED')}
+                        className={statusFilter === 'ARRIVED' ? '' : 'text-green-600'}
+                    >
+                        완료
+                    </Button>
                 </div>
             </div>
 
@@ -434,7 +489,11 @@ export default function VoyagesPage() {
             ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {filteredVoyages.map(voyage => (
-                        <VoyageCard key={voyage.id} voyage={voyage} />
+                        <VoyageCard
+                            key={voyage.id}
+                            voyage={voyage}
+                            onDelete={(v) => setVoyageToDelete(v)}
+                        />
                     ))}
                 </div>
             )}
@@ -445,6 +504,30 @@ export default function VoyagesPage() {
                 onClose={() => setIsNewModalOpen(false)}
                 onCreate={handleCreateVoyage}
             />
+
+            {/* 항차 삭제 확인 다이얼로그 */}
+            <AlertDialog open={!!voyageToDelete} onOpenChange={() => setVoyageToDelete(null)}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>항차를 삭제하시겠습니까?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            '{voyageToDelete?.name}' 항차가 삭제됩니다.
+                            <span className="block mt-2 text-red-500 font-medium">
+                                이 항차에 등록된 화물 데이터는 별도로 남아있습니다.
+                            </span>
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>취소</AlertDialogCancel>
+                        <AlertDialogAction
+                            onClick={handleDeleteVoyage}
+                            className="bg-red-600 hover:bg-red-700"
+                        >
+                            삭제
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
         </div>
     );
 }

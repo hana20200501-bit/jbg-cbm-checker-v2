@@ -22,14 +22,27 @@
 
 export interface ParsedRow {
     rowIndex: number;
+    // 기존 필드
     courier?: string;      // 택배사
     qty: number;           // 수량
-    rawName: string;       // 수령인 이름 (원본)
+    rawName: string;       // 수령인 이름 (내용 컬럼)
     weight?: number;       // 중량
     desc?: string;         // 비고/설명
-    phone?: string;        // 전화번호 (desc에서 추출)
-    region?: string;       // 지역 (이름에서 추출 또는 별도 컸럼)
+    phone?: string;        // 전화번호 (feature에서 추출)
+    region?: string;       // 지역
     rawCells: string[];    // 원본 셀 데이터
+
+    // 📌 새 필드 (사용자 엑셀 양식)
+    // 헤더: 차수/입고일짜/택배사/내용/수량(BOX)/중량(KG)/국적/분류/특징/송장/카테고리/화물 설명
+    voyageSequence?: string; // 차수 (NEW!)
+    no?: number;           // 순번 (No.)
+    arrivalDate?: string;  // 입고일자
+    nationality?: string;  // 국적 (k=한국, c=캄보디아)
+    classification?: string; // 분류 (customer/agency)
+    feature?: string;      // 특징/마킹
+    invoice?: string;      // 송장번호
+    cargoCategory?: string; // 카테고리
+    cargoDesc?: string;    // 화물 설명
 }
 
 export interface ParseResult {
@@ -120,14 +133,16 @@ const looksLikeName = (text: string): boolean => {
 
 /**
  * 행 데이터 분할 (탭 또는 연속 공백)
+ * 📌 주의: 빈 셀도 유지해야 컬럼 인덱스가 밀리지 않음!
  */
 const splitRow = (row: string): string[] => {
     // 먼저 탭으로 분할 시도
     if (row.includes('\t')) {
-        return row.split('\t').map(s => s.trim()).filter(Boolean);
+        // 📌 빈 셀 유지 (filter 제거) - trim만 하고 빈 문자열 유지
+        return row.split('\t').map(s => s.trim());
     }
 
-    // 연속 공백(2개 이상)으로 분할
+    // 연속 공백(2개 이상)으로 분할 - 이 경우는 빈 셀 구분이 어려워 filter 유지
     return row.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
 };
 
@@ -152,29 +167,64 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
 
     // 첫 번째 행이 헤더인지 확인
     const firstRowCells = splitRow(lines[0]);
-    const headerKeywords = ['이름', 'name', '수량', 'qty', '택배', '중량', 'weight', '비고', 'courier'];
+    const headerKeywords = [
+        '이름', 'name', '수량', 'qty', '택배', '중량', 'weight', '비고', 'courier',
+        '내용', '입고', '국적', '분류', '특징', '송장', '카테고리', '화물', 'no.'
+    ];
     const hasHeader = firstRowCells.some(cell =>
-        headerKeywords.some(kw => cell.toLowerCase().includes(kw))
+        headerKeywords.some(kw => cell.toLowerCase().includes(kw.toLowerCase()))
     );
 
     const dataStartIndex = hasHeader ? 1 : 0;
     const headers = hasHeader ? firstRowCells : undefined;
 
     // 컬럼 인덱스 추론 (헤더가 있는 경우)
+    let voyageSequenceColIdx = -1;  // 📌 차수 (NEW!)
+    let noColIdx = -1;
+    let arrivalDateColIdx = -1;
     let nameColIdx = -1;
     let qtyColIdx = -1;
     let courierColIdx = -1;
     let weightColIdx = -1;
+    let nationalityColIdx = -1;
+    let classificationColIdx = -1;
+    let featureColIdx = -1;
+    let invoiceColIdx = -1;
+    let cargoCategoryColIdx = -1;
+    let cargoDescColIdx = -1;
     let descColIdx = -1;
 
     if (headers) {
         headers.forEach((h, i) => {
-            const lower = h.toLowerCase();
-            if (lower.includes('이름') || lower.includes('name') || lower.includes('수령')) nameColIdx = i;
-            else if (lower.includes('수량') || lower.includes('qty') || lower.includes('박스')) qtyColIdx = i;
+            const lower = h.toLowerCase().trim();
+            // 📌 차수 (NEW!)
+            if (lower.includes('차수')) voyageSequenceColIdx = i;
+            // No. / 번호
+            else if (lower === 'no' || lower === 'no.' || lower.includes('번호')) noColIdx = i;
+            // 입고일
+            else if (lower.includes('입고')) arrivalDateColIdx = i;
+            // 택배사
             else if (lower.includes('택배') || lower.includes('courier')) courierColIdx = i;
+            // 내용 (수령인 이름) - 가장 중요!
+            else if (lower.includes('내용') || lower.includes('이름') || lower.includes('name') || lower.includes('수령')) nameColIdx = i;
+            // 수량
+            else if (lower.includes('수량') || lower.includes('qty') || lower.includes('box') || lower.includes('박스')) qtyColIdx = i;
+            // 중량
             else if (lower.includes('중량') || lower.includes('weight') || lower.includes('kg')) weightColIdx = i;
-            else if (lower.includes('비고') || lower.includes('desc') || lower.includes('memo') || lower.includes('설명')) descColIdx = i;
+            // 국적
+            else if (lower.includes('국적')) nationalityColIdx = i;
+            // 분류
+            else if (lower.includes('분류')) classificationColIdx = i;
+            // 특징
+            else if (lower.includes('특징') || lower.includes('마킹')) featureColIdx = i;
+            // 송장
+            else if (lower.includes('송장')) invoiceColIdx = i;
+            // 카테고리
+            else if (lower.includes('카테고리') && !lower.includes('화물')) cargoCategoryColIdx = i;
+            // 화물 설명
+            else if (lower.includes('화물') || (lower.includes('설명') && cargoCategoryColIdx !== i)) cargoDescColIdx = i;
+            // 비고
+            else if (lower.includes('비고') || lower.includes('desc') || lower.includes('memo')) descColIdx = i;
         });
     }
 
@@ -182,7 +232,8 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
 
     for (let i = dataStartIndex; i < lines.length; i++) {
         const cells = splitRow(lines[i]);
-        if (cells.length === 0) continue;
+        // 📌 모든 셀이 빈 경우만 건너뛰기 (빈 셀이 있어도 데이터가 있으면 처리)
+        if (cells.every(c => !c)) continue;
 
         let parsedRow: ParsedRow = {
             rowIndex: i + 1,
@@ -192,12 +243,48 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
         };
 
         // 헤더 기반 파싱
-        if (headers && nameColIdx >= 0) {
-            parsedRow.rawName = cells[nameColIdx] || '';
-            parsedRow.qty = parseInt(cells[qtyColIdx]) || 1;
-            parsedRow.courier = cells[courierColIdx];
-            parsedRow.weight = parseFloat(cells[weightColIdx]) || undefined;
-            parsedRow.desc = cells[descColIdx];
+        if (headers && (nameColIdx >= 0 || cells.length > 3)) {
+            // 📌 차수 (NEW!)
+            if (voyageSequenceColIdx >= 0) parsedRow.voyageSequence = cells[voyageSequenceColIdx]?.trim();
+            // 순번
+            if (noColIdx >= 0 && cells[noColIdx]) {
+                parsedRow.no = parseInt(cells[noColIdx].replace(/[^\d]/g, '')) || undefined;
+            }
+            // 입고일자
+            if (arrivalDateColIdx >= 0) parsedRow.arrivalDate = cells[arrivalDateColIdx]?.trim();
+            // 택배사
+            if (courierColIdx >= 0) parsedRow.courier = cells[courierColIdx]?.trim();
+            // 수령인 이름 (내용)
+            if (nameColIdx >= 0) parsedRow.rawName = cells[nameColIdx]?.trim() || '';
+            // 수량
+            if (qtyColIdx >= 0) {
+                const qtyStr = cells[qtyColIdx]?.replace(/[^\d]/g, '');
+                parsedRow.qty = parseInt(qtyStr) || 1;
+            }
+            // 중량
+            if (weightColIdx >= 0) {
+                const weightStr = cells[weightColIdx]?.replace(/[^\d.]/g, '');
+                parsedRow.weight = parseFloat(weightStr) || undefined;
+            }
+            // 국적
+            if (nationalityColIdx >= 0) parsedRow.nationality = cells[nationalityColIdx]?.trim()?.toLowerCase();
+            // 분류
+            if (classificationColIdx >= 0) parsedRow.classification = cells[classificationColIdx]?.trim()?.toLowerCase();
+            // 특징
+            if (featureColIdx >= 0) parsedRow.feature = cells[featureColIdx]?.trim();
+            // 송장
+            if (invoiceColIdx >= 0) parsedRow.invoice = cells[invoiceColIdx]?.trim();
+            // 카테고리
+            if (cargoCategoryColIdx >= 0) parsedRow.cargoCategory = cells[cargoCategoryColIdx]?.trim();
+            // 화물 설명
+            if (cargoDescColIdx >= 0) parsedRow.cargoDesc = cells[cargoDescColIdx]?.trim();
+            // 비고
+            if (descColIdx >= 0) parsedRow.desc = cells[descColIdx]?.trim();
+
+            // 특징에서 전화번호 추출
+            if (parsedRow.feature && !parsedRow.phone) {
+                parsedRow.phone = extractPhone(parsedRow.feature);
+            }
         }
         // 스마트 파싱 (헤더 없음)
         else {

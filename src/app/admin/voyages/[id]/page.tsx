@@ -35,8 +35,8 @@ import {
     AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 // Firestore 서비스
-import { saveCustomer, saveShipmentsBatch, updateCustomerStats } from '@/lib/firestore-service';
-import { useCustomers } from '@/hooks/use-erp-data';
+import { saveCustomer, saveShipmentsBatch, updateCustomerStats, approveShipment, approveAllShipments } from '@/lib/firestore-service';
+import { useCustomers, useShipments } from '@/hooks/use-erp-data';
 import { isFirebaseConfigured } from '@/lib/firebase';
 // Multi-Factor Matcher
 import {
@@ -46,6 +46,10 @@ import {
     normalizeName as normalizeNameMF,
 } from '@/lib/multi-factor-matcher';
 import type { MatchConfidence, DuplicateGroup, EnhancedStagingRecord } from '@/types';
+// 📌 NEW: StagingGrid 컴포넌트 및 어댑터
+import { StagingGrid } from '@/components/voyage/StagingGrid';
+import { convertRecordsToItems } from '@/lib/staging-adapter';
+import type { StagingItem } from '@/types/staging';
 
 // =============================================================================
 // 상수 및 설정
@@ -65,20 +69,6 @@ const STATUS_CONFIG: Record<MatchStatus, {
         label: '확인됨',
         description: '고객 DB와 정확히 일치'
     },
-    CONFLICT: {
-        icon: AlertTriangle,
-        color: 'text-amber-600',
-        bgColor: 'bg-amber-50',
-        label: '충돌',
-        description: '이름 일치, 세부정보 불일치'
-    },
-    SIMILAR: {
-        icon: HelpCircle,
-        color: 'text-blue-600',
-        bgColor: 'bg-blue-50',
-        label: '검토',
-        description: '유사한 고객 발견'
-    },
     NEW_CUSTOMER: {
         icon: UserPlus,
         color: 'text-purple-600',
@@ -86,12 +76,12 @@ const STATUS_CONFIG: Record<MatchStatus, {
         label: '신규',
         description: '등록되지 않은 고객'
     },
-    DUPLICATE: {
-        icon: AlertCircle,
-        color: 'text-gray-600',
-        bgColor: 'bg-gray-50',
-        label: '중복',
-        description: '이미 등록된 데이터'
+    UNTRACKED: {
+        icon: XIcon,
+        color: 'text-slate-400',
+        bgColor: 'bg-slate-50',
+        label: '비추적',
+        description: '필터 외 항목 (저장됨)'
     },
 };
 
@@ -452,7 +442,8 @@ export default function VoyageImportPage() {
     const params = useParams();
     const router = useRouter();
     const { toast } = useToast();
-    const voyageId = params.id as string;
+    // 📌 URL 디코딩 필수! (한글 voyageId 지원)
+    const voyageId = decodeURIComponent(params.id as string);
 
     // Firestore 고객 데이터 (실시간 구독)
     const { customers: firestoreCustomers, loading: customersLoading } = useCustomers(true);
@@ -465,11 +456,20 @@ export default function VoyageImportPage() {
         ? firestoreCustomers
         : localCustomers;
 
+    // 🆕 Import된 Shipments 실시간 구독
+    const { shipments: importedShipments, loading: shipmentsLoading } = useShipments(voyageId);
+    const [approving, setApproving] = useState(false);
+
     // 상태
     const [rawText, setRawText] = useState('');
     const [stagingRecords, setStagingRecords] = useState<StagingRecord[]>([]);
     const [filterStatus, setFilterStatus] = useState<MatchStatus | 'ALL'>('ALL');
     const [editingId, setEditingId] = useState<string | null>(null);
+
+    // 📌 엑셀 스타일 필터 (전체 표시 후 필터링)
+    const [filterName, setFilterName] = useState(''); // 이름 검색
+    const [filterNationality, setFilterNationality] = useState<'all' | 'k' | 'c'>('all'); // 기본: 전체
+    const [filterClassification, setFilterClassification] = useState<'all' | 'customer' | 'agency' | 'hana' | 'gmarket' | 'coupang' | 'noname'>('all'); // 기본: 전체
 
     // 모달 상태
     const [conflictModal, setConflictModal] = useState<{ isOpen: boolean; record: StagingRecord | null }>({ isOpen: false, record: null });
@@ -497,114 +497,52 @@ export default function VoyageImportPage() {
     };
 
     // ==========================================================================
-    // 핵심 매칭 로직 (Production-Grade)
+    // 핵심 매칭 로직 (Exact Match Only Policy)
     // ==========================================================================
 
     const performMatching = useCallback((name: string, phone?: string, region?: string, address?: string): {
         status: MatchStatus;
         matchedCustomer: Customer | null;
         similarCandidates: SimilarCandidate[];
-        conflict?: StagingRecord['conflict'];
+        warningFlag?: 'PHONE_MISMATCH' | 'REGION_MISMATCH' | null;
     } => {
-        const normalizedInputName = normalizeName(name);
-        const normalizedInputPhone = phone ? normalizePhone(phone) : '';
+        // 📌 Exact Match Only: 이름 정확 일치만!
+        // Fuzzy 매칭 없음 (고객이 수동으로 Kim1, Kim2 등 관리)
 
-        // 1. 정확한 이름 매칭
+        const trimmedName = name.trim().toLowerCase();
+
+        // 정확한 이름 매칭 (대소문자 무시, 공백 trim)
         const exactMatch = masterCustomers.find(c =>
-            normalizeName(c.name) === normalizedInputName ||
-            c.name.toLowerCase() === name.toLowerCase()
+            c.name.trim().toLowerCase() === trimmedName
         );
 
         if (exactMatch) {
-            // 데이터 충돌 체크
-            const conflicts: { field: string; masterValue: string; importedValue: string }[] = [];
+            // 이름 일치! 추가 정보 불일치는 경고만 표시
+            let warningFlag: 'PHONE_MISMATCH' | 'REGION_MISMATCH' | null = null;
 
-            if (phone && normalizePhone(exactMatch.phone) !== normalizedInputPhone) {
-                conflicts.push({ field: '연락처', masterValue: exactMatch.phone, importedValue: phone });
-            }
-            if (region && exactMatch.region?.toLowerCase() !== region.toLowerCase()) {
-                conflicts.push({ field: '지역', masterValue: exactMatch.region || '', importedValue: region });
-            }
-            if (address && exactMatch.addressDetail?.toLowerCase() !== address.toLowerCase()) {
-                conflicts.push({ field: '주소', masterValue: exactMatch.addressDetail || '', importedValue: address });
+            if (phone && exactMatch.phone) {
+                const inputPhone = phone.replace(/[^0-9]/g, '');
+                const dbPhone = exactMatch.phone.replace(/[^0-9]/g, '');
+                if (inputPhone.length >= 6 && dbPhone.length >= 6 && inputPhone !== dbPhone) {
+                    warningFlag = 'PHONE_MISMATCH';
+                }
             }
 
-            if (conflicts.length > 0) {
-                return {
-                    status: 'CONFLICT',
-                    matchedCustomer: exactMatch,
-                    similarCandidates: [],
-                    conflict: {
-                        type: conflicts.length > 1 ? 'MULTIPLE' :
-                            conflicts[0].field === '연락처' ? 'PHONE_MISMATCH' :
-                                conflicts[0].field === '지역' ? 'REGION_MISMATCH' : 'ADDRESS_MISMATCH',
-                        fields: conflicts,
-                        resolution: 'PENDING',
-                    }
-                };
-            }
-
-            return { status: 'VERIFIED', matchedCustomer: exactMatch, similarCandidates: [] };
-        }
-
-        // 2. 부분 이름 매칭 (괄호 제거 후)
-        const partialMatch = masterCustomers.find(c => {
-            const normalizedDbName = normalizeName(c.name);
-            return normalizedDbName.includes(normalizedInputName) ||
-                normalizedInputName.includes(normalizedDbName);
-        });
-
-        if (partialMatch) {
-            return { status: 'VERIFIED', matchedCustomer: partialMatch, similarCandidates: [] };
-        }
-
-        // 3. 연락처로 매칭 시도
-        if (normalizedInputPhone.length >= 8) {
-            const phoneMatch = masterCustomers.find(c =>
-                normalizePhone(c.phone).includes(normalizedInputPhone) ||
-                normalizedInputPhone.includes(normalizePhone(c.phone))
-            );
-            if (phoneMatch) {
-                return {
-                    status: 'CONFLICT',
-                    matchedCustomer: phoneMatch,
-                    similarCandidates: [],
-                    conflict: {
-                        type: 'PHONE_MISMATCH',
-                        fields: [{ field: '이름', masterValue: phoneMatch.name, importedValue: name }],
-                        resolution: 'PENDING',
-                    }
-                };
-            }
-        }
-
-        // 4. 유사도 기반 매칭
-        const similarMatches = masterCustomers
-            .map(c => {
-                const nameSim = calculateSimilarity(normalizedInputName, normalizeName(c.name));
-                const phoneSim = normalizedInputPhone && c.phone ?
-                    calculateSimilarity(normalizedInputPhone, normalizePhone(c.phone)) : 0;
-
-                return {
-                    customer: c,
-                    similarity: Math.max(nameSim, phoneSim * 0.8),
-                    matchReason: nameSim > phoneSim * 0.8 ? '이름 유사' : '연락처 유사'
-                };
-            })
-            .filter(({ similarity }) => similarity > 0.5)
-            .sort((a, b) => b.similarity - a.similarity)
-            .slice(0, 3);
-
-        if (similarMatches.length > 0) {
             return {
-                status: 'SIMILAR',
-                matchedCustomer: null,
-                similarCandidates: similarMatches
+                status: 'VERIFIED',
+                matchedCustomer: exactMatch,
+                similarCandidates: [],
+                warningFlag
             };
         }
 
-        // 5. 매칭 실패 - 신규 고객
-        return { status: 'NEW_CUSTOMER', matchedCustomer: null, similarCandidates: [] };
+        // 매칭 없음 -> 신규 고객
+        return {
+            status: 'NEW_CUSTOMER',
+            matchedCustomer: null,
+            similarCandidates: [],
+            warningFlag: null
+        };
     }, [masterCustomers]);
 
     // ==========================================================================
@@ -677,22 +615,58 @@ export default function VoyageImportPage() {
                 masterCustomers
             );
 
-            // 전화번호가 같은 이전 레코드가 있으면 그 고객과 연결
+            // 📌 이름 정규화 함수 (비교용)
+            const normalizeName = (n: string) => n?.trim().replace(/\s+/g, '').toLowerCase() || '';
+            const currentName = normalizeName(row.rawName);
+
+            // 초기 매칭 결과
             let finalMatchedCustomer = matchedCustomer;
             let finalStatus = status;
 
+            // 전화번호가 같은 이전 레코드가 있으면 고객과 연결 시도
+            // 📌 단, 이름도 일치해야 VERIFIED!
             if (normalizedPhone && seenPhones.has(normalizedPhone)) {
                 const prevRecord = seenPhones.get(normalizedPhone)!;
                 if (prevRecord.matchedCustomer) {
-                    finalMatchedCustomer = prevRecord.matchedCustomer;
-                    finalStatus = 'VERIFIED';
+                    const prevCustomerName = normalizeName(prevRecord.matchedCustomer.name);
+                    // 이름이 일치하면 VERIFIED, 아니면 NEW_CUSTOMER (수동 확인 필요)
+                    if (currentName === prevCustomerName) {
+                        finalMatchedCustomer = prevRecord.matchedCustomer;
+                        finalStatus = 'VERIFIED';
+                    } else {
+                        // 이름 불일치 - 후보는 제시하되 자동 매칭 안함
+                        finalMatchedCustomer = null;
+                        finalStatus = 'NEW_CUSTOMER';
+                    }
                 }
             }
 
-            // 중복 그룹의 고객 우선 적용
+            // 중복 그룹의 고객 우선 적용 (이름 비교 포함)
             if (duplicateGroup?.matchedCustomer) {
-                finalMatchedCustomer = duplicateGroup.matchedCustomer;
-                finalStatus = 'VERIFIED';
+                const groupCustomerName = normalizeName(duplicateGroup.matchedCustomer.name);
+                if (currentName === groupCustomerName) {
+                    finalMatchedCustomer = duplicateGroup.matchedCustomer;
+                    finalStatus = 'VERIFIED';
+                } else {
+                    // 이름 불일치 - 후보만 제시
+                    finalMatchedCustomer = null;
+                    finalStatus = 'NEW_CUSTOMER';
+                }
+            }
+
+            // 📌 Smart Scope: 국적/분류 필터 확인
+            // 필터 범위 밖이면 UNTRACKED로 설정 (저장은 하되 매칭 안함)
+            const rowNationality = row.nationality?.toLowerCase() || '';
+            const rowClassification = row.classification?.toLowerCase() || '';
+
+            const isInNationalityScope = filterNationality === 'all' || rowNationality === filterNationality || !rowNationality;
+            const isInClassificationScope = filterClassification === 'all' || rowClassification === filterClassification || !rowClassification;
+            const isInScope = isInNationalityScope && isInClassificationScope;
+
+            // 필터 범위 밖이면 UNTRACKED
+            if (!isInScope) {
+                finalStatus = 'UNTRACKED';
+                finalMatchedCustomer = null;
             }
 
             const record: StagingRecord = {
@@ -715,9 +689,20 @@ export default function VoyageImportPage() {
                 matchedCustomer: finalMatchedCustomer,
                 similarCandidates: [],
                 isSelected: finalStatus === 'VERIFIED',
-                isResolved: finalStatus === 'VERIFIED',
+                isResolved: finalStatus === 'VERIFIED' || finalStatus === 'UNTRACKED',
                 createdAt: Date.now(),
             };
+
+            // 국적/분류 정보 추가 저장 (raw에 확장)
+            (record as any).nationality = rowNationality;
+            (record as any).classification = rowClassification;
+            (record as any).arrivalDate = row.arrivalDate;
+            (record as any).cargoCategory = row.cargoCategory;
+            (record as any).cargoDesc = row.cargoDesc;
+            (record as any).feature = row.feature;
+            (record as any).invoice = row.invoice;  // 📌 송장 추가
+            (record as any).courier = row.courier;
+            (record as any).weight = row.weight;
 
             records.push(record);
 
@@ -737,19 +722,20 @@ export default function VoyageImportPage() {
         // 중복 그룹 정보 표시
         const duplicateCount = duplicateGroups.reduce((sum, g) => sum + g.memberRowIndices.length - 1, 0);
 
+        // 📌 단순화된 stats (Exact Match Only)
         const stats = {
             verified: records.filter(r => r.matchStatus === 'VERIFIED').length,
-            conflict: records.filter(r => r.matchStatus === 'CONFLICT').length,
-            similar: records.filter(r => r.matchStatus === 'SIMILAR').length,
             newCustomer: records.filter(r => r.matchStatus === 'NEW_CUSTOMER').length,
-            duplicate: records.filter(r => r.matchStatus === 'DUPLICATE').length,
+            untracked: records.filter(r => r.matchStatus === 'UNTRACKED').length,
         };
+
+        const trackedCount = records.length - stats.untracked;
 
         toast({
             title: `파싱 완료 (${formatInfo})`,
-            description: `${records.length}건 분석됨 | ✅${stats.verified} ⚠️${stats.conflict} 🔍${stats.similar} ➕${stats.newCustomer}${duplicateCount > 0 ? ` 📞동일인: ${duplicateCount}건` : ''}`
+            description: `${records.length}건 저장 (✅${stats.verified} 매칭, ➕${stats.newCustomer} 신규, ${stats.untracked} 비추적)`
         });
-    }, [rawText, masterCustomers, toast]);
+    }, [rawText, masterCustomers, toast, filterNationality, filterClassification]);
 
     // ==========================================================================
     // 레코드 조작
@@ -772,8 +758,8 @@ export default function VoyageImportPage() {
                 edited: { ...record.edited, name: newName },
                 matchStatus: matchResult.status,
                 matchedCustomer: matchResult.matchedCustomer,
-                similarCandidates: matchResult.similarCandidates,
-                conflict: matchResult.conflict,
+                similarCandidates: [],
+                warningFlag: matchResult.warningFlag,
                 isSelected: matchResult.status === 'VERIFIED',
                 isResolved: matchResult.status === 'VERIFIED',
             };
@@ -858,14 +844,11 @@ export default function VoyageImportPage() {
     // 전체 재매칭
     const handleRematchAll = useCallback(() => {
         setStagingRecords(prev => {
-            const seenNames = new Set<string>();
+            // 📌 중복 체크 제거: 패킹리스트에서는 같은 이름이 날짜별로 여러 번 나올 수 있음
             return prev.map(record => {
-                const normalizedName = normalizeName(record.edited.name);
-                const isDuplicate = seenNames.has(normalizedName);
-                seenNames.add(normalizedName);
-
-                if (isDuplicate) {
-                    return { ...record, matchStatus: 'DUPLICATE' as MatchStatus, matchedCustomer: null, similarCandidates: [], isSelected: false, isResolved: false };
+                // UNTRACKED 상태는 재매칭하지 않음
+                if (record.matchStatus === 'UNTRACKED') {
+                    return record;
                 }
 
                 const matchResult = performMatching(
@@ -896,10 +879,8 @@ export default function VoyageImportPage() {
     const handleImport = useCallback(async () => {
         setIsImporting(true);
         try {
-            // 저장할 레코드 필터
-            const toImport = stagingRecords.filter(r =>
-                r.isSelected && r.isResolved && (r.matchStatus === 'VERIFIED' || r.conflict?.resolution !== 'PENDING')
-            );
+            // 📌 Save All 정책: 모든 레코드 저장 (UNTRACKED 포함)
+            const toImport = stagingRecords;
 
             if (toImport.length === 0) {
                 toast({ variant: "destructive", title: "저장할 데이터 없음" });
@@ -969,20 +950,40 @@ export default function VoyageImportPage() {
     // 필터링 및 통계
     // ==========================================================================
 
+    // 📌 엑셀 스타일 필터링 (모든 필터 조합)
     const filteredRecords = useMemo(() => {
-        if (filterStatus === 'ALL') return stagingRecords;
-        return stagingRecords.filter(r => r.matchStatus === filterStatus);
-    }, [stagingRecords, filterStatus]);
+        return stagingRecords.filter(record => {
+            // 상태 필터
+            if (filterStatus !== 'ALL' && record.matchStatus !== filterStatus) return false;
+
+            // 이름 검색 필터
+            if (filterName.trim()) {
+                const searchTerm = filterName.toLowerCase();
+                const recordName = (record.edited?.name || record.raw?.name || '').toLowerCase();
+                if (!recordName.includes(searchTerm)) return false;
+            }
+
+            // 국적 필터
+            const recordNationality = ((record as any).nationality || '').toLowerCase();
+            if (filterNationality !== 'all' && recordNationality !== filterNationality) return false;
+
+            // 분류 필터
+            const recordClassification = ((record as any).classification || '').toLowerCase();
+            if (filterClassification !== 'all' && recordClassification !== filterClassification) return false;
+
+            return true;
+        });
+    }, [stagingRecords, filterStatus, filterName, filterNationality, filterClassification]);
 
     const stats = useMemo(() => ({
         total: stagingRecords.length,
         verified: stagingRecords.filter(r => r.matchStatus === 'VERIFIED').length,
-        conflict: stagingRecords.filter(r => r.matchStatus === 'CONFLICT').length,
-        similar: stagingRecords.filter(r => r.matchStatus === 'SIMILAR').length,
         newCustomer: stagingRecords.filter(r => r.matchStatus === 'NEW_CUSTOMER').length,
-        duplicate: stagingRecords.filter(r => r.matchStatus === 'DUPLICATE').length,
-        resolved: stagingRecords.filter(r => r.conflict?.resolution && r.conflict.resolution !== 'PENDING').length,
+        untracked: stagingRecords.filter(r => r.matchStatus === 'UNTRACKED').length,
         selected: stagingRecords.filter(r => r.isSelected && r.isResolved).length,
+        // 📌 ImportConfirmModal에서 필요한 속성 추가
+        resolved: stagingRecords.filter(r => r.isResolved && r.matchStatus !== 'VERIFIED').length,
+        conflict: stagingRecords.filter(r => !r.isResolved && r.matchStatus !== 'VERIFIED' && r.matchStatus !== 'UNTRACKED').length,
     }), [stagingRecords]);
 
     const voyageStatus = VOYAGE_STATUS_STYLES[voyage.status];
@@ -1065,216 +1066,231 @@ export default function VoyageImportPage() {
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">
-                        {/* 통계 바 */}
-                        <div className="flex flex-wrap items-center gap-3 p-3 bg-muted rounded-lg">
-                            <span className="font-medium">전체: {stats.total}</span>
-                            <span className="w-px h-4 bg-border" />
-                            {(Object.keys(STATUS_CONFIG) as MatchStatus[]).map(status => {
-                                const config = STATUS_CONFIG[status];
-                                const count = stats[status.toLowerCase() as keyof typeof stats] as number;
-                                if (count === 0) return null;
-                                return (
-                                    <button
-                                        key={status}
-                                        onClick={() => setFilterStatus(filterStatus === status ? 'ALL' : status)}
-                                        className={cn(
-                                            "flex items-center gap-1 px-2 py-1 rounded text-sm transition-colors",
-                                            filterStatus === status ? `${config.bgColor} ${config.color} font-medium` : "hover:bg-background"
-                                        )}
-                                    >
-                                        <config.icon className="w-4 h-4" />
-                                        {config.label}: {count}
-                                    </button>
-                                );
-                            })}
+                        {/* 📌 StagingGrid has its own tabs, removed duplicate tabs here */}
+
+                        {/* 📌 엑셀 스타일 필터 */}
+                        <div className="flex flex-wrap items-center gap-4 p-3 border rounded-lg bg-slate-50">
+                            <span className="text-sm font-medium text-slate-700">🔍 필터:</span>
+
+                            {/* 이름 검색 */}
+                            <div className="flex items-center gap-2">
+                                <Input
+                                    placeholder="이름 검색..."
+                                    value={filterName}
+                                    onChange={(e) => setFilterName(e.target.value)}
+                                    className="w-[150px] h-8"
+                                />
+                            </div>
+
+                            {/* 국적 필터 */}
+                            <div className="flex items-center gap-2">
+                                <Label className="text-sm">국적</Label>
+                                <Select value={filterNationality} onValueChange={(v: 'all' | 'k' | 'c') => setFilterNationality(v)}>
+                                    <SelectTrigger className="w-[100px] h-8">
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="all">전체</SelectItem>
+                                        <SelectItem value="k">🇰🇷 한국</SelectItem>
+                                        <SelectItem value="c">🇰🇭 캄보디아</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                            </div>
+
+                            {/* 분류 필터 */}
+                            <div className="flex items-center gap-2">
+                                <Label className="text-sm">분류</Label>
+                                <Select value={filterClassification} onValueChange={(v: 'all' | 'customer' | 'agency' | 'hana' | 'gmarket' | 'coupang' | 'noname') => setFilterClassification(v)}>
+                                    <SelectTrigger className="w-[120px] h-8">
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="all">전체</SelectItem>
+                                        <SelectItem value="customer">👤 Customer</SelectItem>
+                                        <SelectItem value="agency">🏢 Agency</SelectItem>
+                                        <SelectItem value="hana">🟣 Hana</SelectItem>
+                                        <SelectItem value="gmarket">🟢 Gmarket</SelectItem>
+                                        <SelectItem value="coupang">🟡 Coupang</SelectItem>
+                                        <SelectItem value="noname">⚪ 무기명</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                            </div>
+
+                            {/* 필터 결과 표시 */}
+                            <span className="text-xs text-slate-600 ml-auto">
+                                표시: <strong>{filteredRecords.length}</strong> / {stagingRecords.length}건
+                            </span>
+
+                            {/* 필터 초기화 */}
+                            {(filterName || filterNationality !== 'all' || filterClassification !== 'all' || filterStatus !== 'ALL') && (
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() => {
+                                        setFilterName('');
+                                        setFilterNationality('all');
+                                        setFilterClassification('all');
+                                        setFilterStatus('ALL');
+                                    }}
+                                >
+                                    초기화
+                                </Button>
+                            )}
                         </div>
 
-                        {/* 테이블 */}
-                        <div className="border rounded-lg overflow-hidden">
-                            <div className="overflow-x-auto">
+                        {/* 📌 NEW: StagingGrid 컴포넌트 */}
+                        <StagingGrid
+                            items={convertRecordsToItems(filteredRecords)}
+                            customers={masterCustomers}
+                            onUpdateItem={(id, updates) => {
+                                // 이름 수정 처리
+                                if (updates.name) {
+                                    handleEditName(id, updates.name);
+                                }
+                            }}
+                            onArchiveItem={(id) => {
+                                // 아카이브 처리 (TODO)
+                                console.log('Archive:', id);
+                            }}
+                            onQuickRegister={(item) => {
+                                // 신규 등록 모달 열기
+                                setNewCustomerModal({
+                                    isOpen: true,
+                                    data: {
+                                        name: item.edited.name,
+                                        phone: item.parsed.phone,
+                                        region: ''
+                                    }
+                                });
+                            }}
+                            onLinkCustomer={(itemId, customerId) => {
+                                // 고객 연결 처리
+                                const customer = masterCustomers.find(c => c.id === customerId);
+                                if (customer) {
+                                    setStagingRecords(prev => prev.map(r =>
+                                        r.stagingId === itemId
+                                            ? {
+                                                ...r,
+                                                matchedCustomer: customer,
+                                                matchStatus: 'VERIFIED' as const,
+                                                edited: { ...r.edited, name: customer.name },  // 이름도 업데이트
+                                                isSelected: true,
+                                                isResolved: true,
+                                            }
+                                            : r
+                                    ));
+                                    toast({ title: '고객 연결 완료', description: `${customer.name} (#${customer.podCode})` });
+                                }
+                            }}
+                            onSaveAll={() => {
+                                // Import 확인 모달 열기
+                                setImportConfirmModal(true);
+                            }}
+                            isSaving={false}
+                        />
+                    </CardContent>
+                </Card>
+            )}
+
+            {/* 🆕 Step 3: Import된 Shipments 목록 (검토 및 승인) */}
+            {importedShipments.length > 0 && (
+                <Card>
+                    <CardHeader className="pb-3">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <CardTitle className="flex items-center gap-2">
+                                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-green-600 text-white text-xs font-bold">3</span>
+                                    Import된 화물 목록
+                                    <Badge variant="secondary">{importedShipments.length}건</Badge>
+                                </CardTitle>
+                                <CardDescription>
+                                    데이터를 검토하고 승인하세요. 승인된 화물만 CBM 측정이 가능합니다.
+                                </CardDescription>
+                            </div>
+                            <div className="flex gap-2">
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={approving || importedShipments.filter(s => s.status === 'DRAFT').length === 0}
+                                    onClick={async () => {
+                                        setApproving(true);
+                                        try {
+                                            const count = await approveAllShipments(voyageId);
+                                            toast({ title: "전체 승인 완료", description: `${count}건이 승인되었습니다.` });
+                                        } catch (e) {
+                                            toast({ variant: "destructive", title: "승인 실패" });
+                                        } finally {
+                                            setApproving(false);
+                                        }
+                                    }}
+                                >
+                                    {approving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
+                                    전체 승인 ({importedShipments.filter(s => s.status === 'DRAFT').length}건)
+                                </Button>
+                            </div>
+                        </div>
+                    </CardHeader>
+                    <CardContent>
+                        {shipmentsLoading ? (
+                            <div className="flex items-center justify-center py-8">
+                                <Loader2 className="w-6 h-6 animate-spin text-primary" />
+                            </div>
+                        ) : (
+                            <div className="border rounded-lg overflow-hidden">
                                 <table className="w-full text-sm">
-                                    <thead className="bg-muted/50">
+                                    <thead className="bg-muted">
                                         <tr>
-                                            <th className="p-3 text-left w-12">#</th>
-                                            <th className="p-3 text-left w-24">상태</th>
-                                            <th className="p-3 text-left min-w-[160px]">입력된 이름</th>
-                                            <th className="p-3 text-left min-w-[200px]">매칭 결과</th>
-                                            <th className="p-3 text-left">연락처</th>
-                                            <th className="p-3 text-left">지역</th>
-                                            <th className="p-3 text-center w-24">액션</th>
+                                            <th className="px-3 py-2 text-left">상태</th>
+                                            <th className="px-3 py-2 text-left">고객명</th>
+                                            <th className="px-3 py-2 text-left">POD</th>
+                                            <th className="px-3 py-2 text-center">수량</th>
+                                            <th className="px-3 py-2 text-center">액션</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {filteredRecords.map((record) => {
-                                            const statusConfig = STATUS_CONFIG[record.matchStatus];
-                                            const StatusIcon = statusConfig.icon;
-
-                                            return (
-                                                <tr key={record.stagingId} className={cn("border-t", statusConfig.bgColor)}>
-                                                    <td className="p-3 text-muted-foreground">{record.rowIndex}</td>
-
-                                                    <td className="p-3">
-                                                        <div className={cn("flex items-center gap-1.5", statusConfig.color)}>
-                                                            <StatusIcon className="w-4 h-4" />
-                                                            <span className="font-medium text-xs">{statusConfig.label}</span>
-                                                        </div>
-                                                    </td>
-
-                                                    <td className="p-3">
-                                                        {editingId === record.stagingId ? (
-                                                            <Input
-                                                                defaultValue={record.edited.name}
-                                                                autoFocus
-                                                                className="h-8"
-                                                                onBlur={(e) => handleEditName(record.stagingId, e.target.value)}
-                                                                onKeyDown={(e) => {
-                                                                    if (e.key === 'Enter') handleEditName(record.stagingId, e.currentTarget.value);
-                                                                    if (e.key === 'Escape') setEditingId(null);
-                                                                }}
-                                                            />
-                                                        ) : (
-                                                            <div
-                                                                className="cursor-pointer group"
-                                                                onClick={() => setEditingId(record.stagingId)}
-                                                            >
-                                                                <span className={cn(
-                                                                    "font-medium",
-                                                                    record.edited.name !== record.raw.name && "text-blue-600"
-                                                                )}>
-                                                                    {record.edited.name}
-                                                                </span>
-                                                                <Edit3 className="w-3 h-3 ml-1 inline opacity-0 group-hover:opacity-50" />
-                                                                {record.edited.name !== record.raw.name && (
-                                                                    <div className="text-xs text-muted-foreground line-through">{record.raw.name}</div>
-                                                                )}
-                                                            </div>
-                                                        )}
-                                                    </td>
-
-                                                    <td className="p-3">
-                                                        {record.matchStatus === 'VERIFIED' && record.matchedCustomer && (
-                                                            <div className="text-green-700">
-                                                                <div className="font-medium">{record.matchedCustomer.name}</div>
-                                                                <div className="text-xs text-green-600">
-                                                                    #{record.matchedCustomer.podCode} · {record.matchedCustomer.region}
-                                                                </div>
-                                                            </div>
-                                                        )}
-
-                                                        {record.matchStatus === 'CONFLICT' && record.matchedCustomer && (
-                                                            <div className="space-y-1">
-                                                                <div className="text-amber-700 font-medium">{record.matchedCustomer.name}</div>
-                                                                {record.conflict?.resolution === 'PENDING' ? (
-                                                                    <Button size="sm" variant="outline" className="h-7 text-xs border-amber-300 text-amber-700"
-                                                                        onClick={() => setConflictModal({ isOpen: true, record })}>
-                                                                        충돌 해결 필요
-                                                                    </Button>
-                                                                ) : (
-                                                                    <Badge variant="outline" className="text-xs border-green-300 text-green-700">
-                                                                        ✓ {record.conflict?.resolution === 'UPDATE_MASTER' ? 'DB 업데이트' : '이번만 사용'}
-                                                                    </Badge>
-                                                                )}
-                                                            </div>
-                                                        )}
-
-                                                        {record.matchStatus === 'SIMILAR' && record.similarCandidates.length > 0 && (
-                                                            <Select onValueChange={(id) => {
-                                                                const customer = masterCustomers.find(c => c.id === id);
-                                                                if (customer) handleSelectSimilar(record.stagingId, customer);
-                                                            }}>
-                                                                <SelectTrigger className="h-8 text-blue-700 border-blue-300">
-                                                                    <SelectValue placeholder="유사 고객 선택..." />
-                                                                </SelectTrigger>
-                                                                <SelectContent>
-                                                                    {record.similarCandidates.map(c => (
-                                                                        <SelectItem key={c.customer.id} value={c.customer.id}>
-                                                                            {c.customer.name} ({Math.round(c.similarity * 100)}%)
-                                                                        </SelectItem>
-                                                                    ))}
-                                                                </SelectContent>
-                                                            </Select>
-                                                        )}
-
-                                                        {record.matchStatus === 'NEW_CUSTOMER' && (
-                                                            <Button size="sm" variant="outline" className="h-7 text-xs border-purple-300 text-purple-700"
-                                                                onClick={() => setNewCustomerModal({
-                                                                    isOpen: true,
-                                                                    data: { name: record.edited.name, phone: record.raw.phone, region: record.raw.region }
-                                                                })}>
-                                                                <UserPlus className="w-3 h-3 mr-1" />
-                                                                신규 등록
-                                                            </Button>
-                                                        )}
-
-                                                        {record.matchStatus === 'DUPLICATE' && (
-                                                            <span className="text-gray-500 text-xs">중복 데이터</span>
-                                                        )}
-                                                    </td>
-
-                                                    <td className="p-3 text-muted-foreground text-xs">
-                                                        {record.matchedCustomer?.phone || record.raw.phone || '-'}
-                                                    </td>
-
-                                                    <td className="p-3 text-muted-foreground text-xs">
-                                                        {record.matchedCustomer?.region || record.raw.region || '-'}
-                                                    </td>
-
-                                                    <td className="p-3 text-center">
-                                                        <DropdownMenu>
-                                                            <DropdownMenuTrigger asChild>
-                                                                <Button variant="ghost" size="icon" className="h-7 w-7">
-                                                                    <MoreHorizontal className="w-4 h-4" />
-                                                                </Button>
-                                                            </DropdownMenuTrigger>
-                                                            <DropdownMenuContent align="end">
-                                                                <DropdownMenuItem onClick={() => setEditingId(record.stagingId)}>
-                                                                    <Edit3 className="w-4 h-4 mr-2" />
-                                                                    이름 수정
-                                                                </DropdownMenuItem>
-                                                                {record.matchStatus === 'CONFLICT' && (
-                                                                    <DropdownMenuItem onClick={() => setConflictModal({ isOpen: true, record })}>
-                                                                        <AlertTriangle className="w-4 h-4 mr-2" />
-                                                                        충돌 해결
-                                                                    </DropdownMenuItem>
-                                                                )}
-                                                                {(record.matchStatus === 'NEW_CUSTOMER' || record.matchStatus === 'SIMILAR') && (
-                                                                    <DropdownMenuItem onClick={() => setNewCustomerModal({
-                                                                        isOpen: true,
-                                                                        data: { name: record.edited.name, phone: record.raw.phone, region: record.raw.region }
-                                                                    })}>
-                                                                        <UserPlus className="w-4 h-4 mr-2" />
-                                                                        신규 등록
-                                                                    </DropdownMenuItem>
-                                                                )}
-                                                                <DropdownMenuSeparator />
-                                                                <DropdownMenuItem onClick={() => handleDeleteRecord(record.stagingId)} className="text-red-600">
-                                                                    <Trash2 className="w-4 h-4 mr-2" />
-                                                                    삭제
-                                                                </DropdownMenuItem>
-                                                            </DropdownMenuContent>
-                                                        </DropdownMenu>
-                                                    </td>
-                                                </tr>
-                                            );
-                                        })}
+                                        {importedShipments.map(shipment => (
+                                            <tr key={shipment.id} className="border-t hover:bg-muted/50">
+                                                <td className="px-3 py-2">
+                                                    {shipment.status === 'DRAFT' ? (
+                                                        <Badge variant="secondary" className="bg-yellow-100 text-yellow-800">📝 검토중</Badge>
+                                                    ) : shipment.status === 'APPROVED' ? (
+                                                        <Badge variant="secondary" className="bg-green-100 text-green-800">✅ 승인됨</Badge>
+                                                    ) : (
+                                                        <Badge variant="secondary">{shipment.status}</Badge>
+                                                    )}
+                                                </td>
+                                                <td className="px-3 py-2 font-medium">{shipment.snapshot?.customerName || shipment.customerName}</td>
+                                                <td className="px-3 py-2 text-muted-foreground">#{shipment.snapshot?.customerPodCode || shipment.customerPodCode}</td>
+                                                <td className="px-3 py-2 text-center">{shipment.quantity || 1}</td>
+                                                <td className="px-3 py-2 text-center">
+                                                    {shipment.status === 'DRAFT' && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="ghost"
+                                                            className="h-7 text-xs"
+                                                            onClick={async () => {
+                                                                try {
+                                                                    await approveShipment(shipment.id);
+                                                                    toast({ title: "승인 완료" });
+                                                                } catch (e) {
+                                                                    toast({ variant: "destructive", title: "승인 실패" });
+                                                                }
+                                                            }}
+                                                        >
+                                                            <Check className="w-3 h-3 mr-1" />
+                                                            승인
+                                                        </Button>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        ))}
                                     </tbody>
                                 </table>
                             </div>
-                        </div>
-
-                        {/* Import 버튼 */}
-                        <div className="flex justify-between items-center pt-4 border-t">
-                            <div className="text-sm text-muted-foreground">
-                                Import 가능: <strong className="text-foreground">{stats.verified + stats.resolved}건</strong> / {stats.total}건
-                            </div>
-                            <Button
-                                size="lg"
-                                onClick={() => setImportConfirmModal(true)}
-                                disabled={stats.verified + stats.resolved === 0}
-                            >
-                                <ArrowRight className="w-4 h-4 mr-2" />
-                                다음: Import 확인
-                            </Button>
+                        )}
+                        <div className="mt-3 text-xs text-muted-foreground">
+                            📌 DRAFT: 검토 필요 | ✅ APPROVED: CBM 측정 가능
                         </div>
                     </CardContent>
                 </Card>
