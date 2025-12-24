@@ -74,12 +74,17 @@ const COURIER_PATTERNS = [
     '택배', '배송', '퀵', '화물',
 ];
 
-// 전화번호 패턴
+// 📌 전화번호 패턴 (확장됨)
 const PHONE_PATTERNS = [
-    /01[0-9]-?\d{3,4}-?\d{4}/,           // 한국 휴대폰
-    /0[2-6][0-9]-?\d{3,4}-?\d{4}/,       // 한국 유선
-    /0[1-9]{2}\s?\d{3}\s?\d{3,4}/,       // 캄보디아 (070, 010, 012...)
-    /\+855\s?\d{2,3}\s?\d{3}\s?\d{3,4}/, // 캄보디아 국제
+    /01[0-9]-?\d{3,4}-?\d{4}/,             // 한국 휴대폰 (010, 011, 017, etc)
+    /02-?\d{3,4}-?\d{4}/,                   // 서울 유선
+    /0[3-6][1-9]-?\d{3,4}-?\d{4}/,          // 지방 유선 (031, 032, 041...)
+    /070-?\d{3,4}-?\d{4}/,                  // 인터넷 전화
+    /050[0-9]-?\d{3,4}-?\d{4}/,             // 안심번호
+    /0[1-9]{2}\s?\d{3}\s?\d{3,4}/,          // 캄보디아 (070, 010, 012...)
+    /\+855\s?\d{2,3}\s?\d{3}\s?\d{3,4}/,    // 캄보디아 국제
+    /\+82\s?\d{1,2}\s?\d{3,4}\s?\d{4}/,     // 한국 국제
+    /\d{10,11}/,                            // 하이픈 없는 전화번호 (fallback)
 ];
 
 // =============================================================================
@@ -322,14 +327,31 @@ export function detectDuplicateGroups(
 // =============================================================================
 
 /**
- * 구글 시트에서 복사한 데이터를 파싱
+ * 구글 시트에서 복사한 데이터를 파싱 (비동기 + 배치 처리)
+ * 
+ * 📌 개선사항:
+ * - Ghost Row 필터링 (빈 행, 공백/쉼표만 있는 행 제거)
+ * - 확장된 전화번호 패턴
+ * - 50행마다 UI Thread 양보 (Async Batching)
  * 
  * @param rawText - 붙여넣기한 원본 텍스트
- * @returns ParseResult
+ * @returns Promise<ParseResult>
  */
-export function parseGoogleSheetData(rawText: string): ParseResult {
+export async function parseGoogleSheetData(rawText: string): Promise<ParseResult> {
     const warnings: string[] = [];
-    const lines = rawText.trim().split('\n').filter(line => line.trim());
+
+    // 📌 FIX: Ghost Row 필터링 (빈 행, 공백/쉼표만 있는 행 제거)
+    const lines = rawText
+        .trim()
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => {
+            // 빈 줄 제거
+            if (!line) return false;
+            // 공백, 탭, 쉼표만 있는 줄 제거
+            if (/^[\s,\t]*$/.test(line)) return false;
+            return true;
+        });
 
     if (lines.length === 0) {
         return { success: false, items: [], detectedFormat: 'TAB', hasHeader: false, warnings: ['빈 데이터'] };
@@ -339,7 +361,7 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
     const hasTab = rawText.includes('\t');
     const detectedFormat = hasTab ? 'TAB' : 'SPACE';
 
-    // 행 분할 함수
+    // 행 분할 함수 (모든 셀에 trim 적용)
     const splitRow = (row: string): string[] => {
         if (row.includes('\t')) {
             return row.split('\t').map(s => s.trim()).filter(Boolean);
@@ -349,7 +371,7 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
 
     // 첫 번째 행이 헤더인지 확인
     const firstRowCells = splitRow(lines[0]);
-    const headerKeywords = ['이름', 'name', '수량', 'qty', '택배', '중량', 'weight', '비고', 'courier'];
+    const headerKeywords = ['이름', 'name', '수량', 'qty', '택배', '중량', 'weight', '비고', 'courier', '특징', '송장'];
     const hasHeader = firstRowCells.some(cell =>
         headerKeywords.some(kw => cell.toLowerCase().includes(kw))
     );
@@ -358,8 +380,14 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
     const headers = hasHeader ? firstRowCells : undefined;
 
     const items: ParsedItem[] = [];
+    const BATCH_SIZE = 50; // 📌 50행마다 UI Thread 양보
 
     for (let i = dataStartIndex; i < lines.length; i++) {
+        // 📌 Async Batching: 50행마다 UI 스레드 양보
+        if ((i - dataStartIndex) > 0 && (i - dataStartIndex) % BATCH_SIZE === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
         const cells = splitRow(lines[i]);
         if (cells.length === 0) continue;
 
@@ -442,9 +470,11 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
             }
         }
 
-        // 비고에서 전화번호 추출
-        if (item.desc && !item.phone) {
-            item.phone = extractPhone(item.desc);
+        // 📌 FIX: 비고 + 전체 셀에서 전화번호 재검색
+        if (!item.phone) {
+            // 모든 셀 합쳐서 전화번호 추출 시도
+            const allText = cells.join(' ');
+            item.phone = extractPhone(allText);
         }
 
         if (item.rawName) {

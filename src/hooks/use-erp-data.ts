@@ -12,6 +12,7 @@ import {
     subscribeToCustomers,
     subscribeToVoyages,
     subscribeToShipments,
+    subscribeToShipment,
     getAllCustomers,
     getAllVoyages,
     getShipmentsByVoyage,
@@ -151,6 +152,39 @@ export function useShipments(voyageId: string | null) {
     }, [voyageId]);
 
     return { shipments, loading, error };
+}
+
+// =============================================================================
+// useShipment - 단일 화물 정보 실시간 구독
+// =============================================================================
+
+export function useShipment(shipmentId: string | null) {
+    const [shipment, setShipment] = useState<Shipment | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<Error | null>(null);
+
+    useEffect(() => {
+        if (!isFirebaseConfigured || !shipmentId) {
+            setLoading(false);
+            return;
+        }
+
+        setLoading(true);
+
+        try {
+            const unsubscribe = subscribeToShipment(shipmentId, (data) => {
+                setShipment(data);
+                setLoading(false);
+            });
+
+            return () => unsubscribe();
+        } catch (err) {
+            setError(err as Error);
+            setLoading(false);
+        }
+    }, [shipmentId]);
+
+    return { shipment, loading, error };
 }
 
 // =============================================================================

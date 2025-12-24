@@ -109,7 +109,8 @@ export type ShipmentStatus =
   | 'INVOICED'    // 인보이스 발행 완료
   | 'PAID'        // 결제 완료
   | 'DELIVERED'   // 배송 완료
-  | 'CANCELLED';  // 취소됨
+  | 'CANCELLED'   // 취소됨
+  | 'UNTRACKED';  // 📌 Zone 3 Fix: 추적 안 함 (데이터 보존용)
 
 /**
  * 고객 통계 (Customer Statistics)
@@ -243,14 +244,7 @@ export interface Shipment {
   // 📌 SNAPSHOT: 저장 시점의 고객 정보 (History Protection)
   // 📌 고객이 주소를 변경해도 기존 인보이스는 변하지 않음!
   // ========================================================================
-  snapshot: {
-    customerName: string;
-    customerPhone: string;
-    customerAddress: string;
-    customerRegion: string;
-    discountRate: number;
-    capturedAt: Timestamp | { seconds: number; nanoseconds: number };
-  } | null;
+  snapshot: CustomerSnapshot | null;
 
   // 기존 호환성: 고객 정보 직접 필드 (이전 코드 지원)
   customerName: string;
@@ -288,10 +282,13 @@ export interface Shipment {
   // CBM 측정 데이터
   totalCbm?: number;
   boxDimensions?: {
+    id?: string;        // Unique Box ID
     length: number;
     width: number;
     height: number;
     quantity: number;
+    imageUrl?: string;  // Photo URL
+    memo?: string;      // Custom name/memo
   }[];
 
   // 인보이스 항목
@@ -336,6 +333,34 @@ export interface Shipment {
   createdAt: Timestamp | { seconds: number; nanoseconds: number };
   updatedAt?: Timestamp | { seconds: number; nanoseconds: number };
   createdBy?: string;           // Admin UID
+}
+
+/**
+ * 파싱된 행 데이터 (Parsed Row)
+ * 📌 packing-list-parser.ts에서 이동됨
+ */
+export interface ParsedRow {
+  rowIndex: number;
+  // 기존 필드
+  courier?: string;      // 택배사
+  qty: number;           // 수량
+  rawName: string;       // 수령인 이름 (내용 컬럼)
+  weight?: number;       // 중량
+  desc?: string;         // 비고/설명
+  phone?: string;        // 전화번호 (feature에서 추출)
+  region?: string;       // 지역
+  rawCells: string[];    // 원본 셀 데이터
+
+  // 📌 새 필드 (사용자 엑셀 양식)
+  voyageSequence?: string; // 차수 (NEW!)
+  no?: number;           // 순번 (No.)
+  arrivalDate?: string;  // 입고일자
+  nationality?: string;  // 국적 (k=한국, c=캄보디아)
+  classification?: string; // 분류 (customer/agency)
+  feature?: string;      // 특징/마킹
+  invoice?: string;      // 송장번호
+  cargoCategory?: string; // 카테고리
+  cargoDesc?: string;    // 화물 설명
 }
 
 /**
@@ -451,12 +476,23 @@ export interface StagingRecord {
     phone?: string;
     region?: string;
     address?: string;
+    description?: string;
+    quantity?: number;
+    memo?: string;
   };
+
+  // 📌 파싱 결과
+  parsed: ParsedRow;
 
   // 매칭 결과
   matchStatus: MatchStatus;
   matchedCustomer: Customer | null;
   similarCandidates: SimilarCandidate[];
+  conflict?: {
+    type: ConflictType;
+    resolution?: ConflictResolution;
+    fields?: { field: string; masterValue: string; importedValue: string }[];
+  };
 
   // ========================================================================
   // 📌 Visual Diff: 불일치 표시용

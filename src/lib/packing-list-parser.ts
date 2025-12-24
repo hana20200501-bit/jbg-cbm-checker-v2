@@ -16,34 +16,11 @@
  * - desc: 화물 설명/비고
  */
 
+import { ParsedRow } from '@/types';
+
 // =============================================================================
 // 타입 정의
 // =============================================================================
-
-export interface ParsedRow {
-    rowIndex: number;
-    // 기존 필드
-    courier?: string;      // 택배사
-    qty: number;           // 수량
-    rawName: string;       // 수령인 이름 (내용 컬럼)
-    weight?: number;       // 중량
-    desc?: string;         // 비고/설명
-    phone?: string;        // 전화번호 (feature에서 추출)
-    region?: string;       // 지역
-    rawCells: string[];    // 원본 셀 데이터
-
-    // 📌 새 필드 (사용자 엑셀 양식)
-    // 헤더: 차수/입고일짜/택배사/내용/수량(BOX)/중량(KG)/국적/분류/특징/송장/카테고리/화물 설명
-    voyageSequence?: string; // 차수 (NEW!)
-    no?: number;           // 순번 (No.)
-    arrivalDate?: string;  // 입고일자
-    nationality?: string;  // 국적 (k=한국, c=캄보디아)
-    classification?: string; // 분류 (customer/agency)
-    feature?: string;      // 특징/마킹
-    invoice?: string;      // 송장번호
-    cargoCategory?: string; // 카테고리
-    cargoDesc?: string;    // 화물 설명
-}
 
 export interface ParseResult {
     success: boolean;
@@ -68,12 +45,17 @@ const COURIER_PATTERNS = [
     '택배', '배송', '퀵', '화물',
 ];
 
-// 전화번호 패턴 (한국/캄보디아)
+// 📌 전화번호 패턴 (확장됨 - Fix for "Rigid Regex")
 const PHONE_PATTERNS = [
-    /01[0-9]-?\d{3,4}-?\d{4}/,           // 한국 휴대폰
-    /0[2-6][0-9]-?\d{3,4}-?\d{4}/,       // 한국 유선
-    /0[1-9]{2}\s?\d{3}\s?\d{3,4}/,       // 캄보디아 (070, 010, 012...)
-    /\+855\s?\d{2,3}\s?\d{3}\s?\d{3,4}/, // 캄보디아 국제
+    /01[0-9]-?\d{3,4}-?\d{4}/,             // 한국 휴대폰 (010, 011, 017, etc)
+    /02-?\d{3,4}-?\d{4}/,                   // 서울 유선
+    /0[3-6][1-9]-?\d{3,4}-?\d{4}/,          // 지방 유선 (031, 032, 041...)
+    /070-?\d{3,4}-?\d{4}/,                  // 인터넷 전화
+    /050[0-9]-?\d{3,4}-?\d{4}/,             // 안심번호
+    /0[1-9]{2}\s?\d{3}\s?\d{3,4}/,          // 캄보디아 (070, 010, 012...)
+    /\+855\s?\d{2,3}\s?\d{3}\s?\d{3,4}/,    // 캄보디아 국제
+    /\+82\s?\d{1,2}\s?\d{3,4}\s?\d{4}/,     // 한국 국제
+    /\d{10,11}/,                            // 하이픈 없는 전화번호 (fallback)
 ];
 
 // 중량 패턴 (숫자.소수)
@@ -87,12 +69,60 @@ const QTY_PATTERN = /^\d+$/;
 // =============================================================================
 
 /**
+ * HTML 태그 제거 및 보이지 않는 문자(Zero-width space) 정제
+ * Checks for HTML Infection (#3) and Invisible Garbage (#1)
+ */
+const cleanCellText = (text: string): string => {
+    if (!text) return '';
+    // 1. HTML Tags removal
+    let clean = text.replace(/<[^>]*>/g, ' ');
+    // 2. Invisible chars removal (Zero-width space, etc)
+    // 3. Trim
+    clean = clean.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    // 4. Formula Zombies (#6) - Remove #N/A, #REF!
+    if (clean.startsWith('#') && (clean.includes('N/A') || clean.includes('REF!'))) {
+        return '';
+    }
+    return clean;
+};
+
+/**
+ * 엑셀 날짜 시리얼 넘버 또는 다양한 날짜 포맷 파싱
+ * Checks for Date Chaos (#2)
+ */
+const parseExcelDate = (text: string): string => {
+    const clean = cleanCellText(text);
+    if (!clean) return '';
+
+    // 1. Excel Serial Number (e.g. 45293)
+    if (/^\d{5}$/.test(clean)) {
+        const serial = parseInt(clean, 10);
+        // Excel base date: Dec 30, 1899
+        const date = new Date(1899, 11, 30);
+        date.setDate(date.getDate() + serial);
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    // 2. YYYY.MM.DD or YYYY-MM-DD or MM/DD
+    const datePattern = /(\d{4})[./-](\d{1,2})[./-](\d{1,2})/;
+    const match = clean.match(datePattern);
+    if (match) {
+        return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+    }
+
+    return clean; // Fallback
+};
+
+/**
  * 문자열이 택배사 이름인지 확인
  */
 const isCourier = (text: string): boolean => {
-    const upper = text.toUpperCase();
+    const clean = cleanCellText(text).toUpperCase();
     return COURIER_PATTERNS.some(c =>
-        upper.includes(c.toUpperCase()) || c.toUpperCase().includes(upper)
+        clean.includes(c.toUpperCase()) || c.toUpperCase().includes(clean)
     );
 };
 
@@ -114,19 +144,20 @@ const extractPhone = (text: string): string | undefined => {
  * - 택배사 아님
  */
 const looksLikeName = (text: string): boolean => {
-    if (!text || text.length < 2) return false;
+    const clean = cleanCellText(text);
+    if (!clean || clean.length < 2) return false;
 
     // 순수 숫자면 이름 아님
-    if (/^\d+\.?\d*$/.test(text)) return false;
+    if (/^\d+\.?\d*$/.test(clean)) return false;
 
     // 택배사 이름이면 제외
-    if (isCourier(text)) return false;
+    if (isCourier(clean)) return false;
 
     // 한글 포함 여부
-    const hasKorean = /[가-힣]/.test(text);
+    const hasKorean = /[가-힣]/.test(clean);
 
     // 영문 이름 패턴 (Mr, Ms, 대문자 시작)
-    const hasEnglishName = /^(Mr|Ms|Mrs|Miss)?\.?\s*[A-Z][a-z]+/.test(text);
+    const hasEnglishName = /^(Mr|Ms|Mrs|Miss)?\.?\s*[A-Z][a-z]+/.test(clean);
 
     return hasKorean || hasEnglishName;
 };
@@ -139,11 +170,11 @@ const splitRow = (row: string): string[] => {
     // 먼저 탭으로 분할 시도
     if (row.includes('\t')) {
         // 📌 빈 셀 유지 (filter 제거) - trim만 하고 빈 문자열 유지
-        return row.split('\t').map(s => s.trim());
+        return row.split('\t').map(cleanCellText);
     }
 
     // 연속 공백(2개 이상)으로 분할 - 이 경우는 빈 셀 구분이 어려워 filter 유지
-    return row.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+    return row.split(/\s{2,}/).map(cleanCellText).filter(Boolean);
 };
 
 // =============================================================================
@@ -151,11 +182,26 @@ const splitRow = (row: string): string[] => {
 // =============================================================================
 
 /**
- * 구글 시트에서 복사한 패킹리스트 데이터를 파싱
+ * 구글 시트에서 복사한 패킹리스트 데이터를 파싱 (비동기 + 배치 처리)
+ * 
+ * 📌 개선사항:
+ * - Ghost Row 필터링 (빈 행, 공백/쉼표만 있는 행 제거)
+ * - 확장된 전화번호 패턴
+ * - 50행마다 UI Thread 양보 (Async Batching)
  */
-export function parseGoogleSheetData(rawText: string): ParseResult {
+export async function parseGoogleSheetData(rawText: string): Promise<ParseResult> {
     const warnings: string[] = [];
-    const lines = rawText.trim().split('\n').filter(line => line.trim());
+
+    // 📌 Ghost Row 필터링
+    const lines = rawText
+        .trim()
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => {
+            if (!line) return false;
+            if (/^[\s,\t]*$/.test(line)) return false;
+            return true;
+        });
 
     if (lines.length === 0) {
         return { success: false, rows: [], detectedFormat: 'TAB', hasHeader: false, warnings: ['빈 데이터'] };
@@ -167,13 +213,19 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
 
     // 첫 번째 행이 헤더인지 확인
     const firstRowCells = splitRow(lines[0]);
+
+    // Fuzzy Matching for Headers (#4 Header Typos)
+    const normalizeHeader = (h: string) => h.toLowerCase().replace(/[^a-z가-힣0-9]/g, '');
+
     const headerKeywords = [
-        '이름', 'name', '수량', 'qty', '택배', '중량', 'weight', '비고', 'courier',
-        '내용', '입고', '국적', '분류', '특징', '송장', '카테고리', '화물', 'no.'
+        '이름', 'name', '수량', 'qty', 'box', '택배', '중량', 'weight', '비고', 'courier',
+        '내용', '입고', '국적', '분류', '특징', '송장', '카테고리', '화물', 'no'
     ];
-    const hasHeader = firstRowCells.some(cell =>
-        headerKeywords.some(kw => cell.toLowerCase().includes(kw.toLowerCase()))
-    );
+
+    const hasHeader = firstRowCells.some(cell => {
+        const norm = normalizeHeader(cell);
+        return headerKeywords.some(kw => norm.includes(kw));
+    });
 
     const dataStartIndex = hasHeader ? 1 : 0;
     const headers = hasHeader ? firstRowCells : undefined;
@@ -196,43 +248,40 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
 
     if (headers) {
         headers.forEach((h, i) => {
+            const norm = normalizeHeader(h);
             const lower = h.toLowerCase().trim();
+
             // 📌 차수 (NEW!)
-            if (lower.includes('차수')) voyageSequenceColIdx = i;
-            // No. / 번호
-            else if (lower === 'no' || lower === 'no.' || lower.includes('번호')) noColIdx = i;
-            // 입고일
-            else if (lower.includes('입고')) arrivalDateColIdx = i;
-            // 택배사
-            else if (lower.includes('택배') || lower.includes('courier')) courierColIdx = i;
-            // 내용 (수령인 이름) - 가장 중요!
-            else if (lower.includes('내용') || lower.includes('이름') || lower.includes('name') || lower.includes('수령')) nameColIdx = i;
-            // 수량
-            else if (lower.includes('수량') || lower.includes('qty') || lower.includes('box') || lower.includes('박스')) qtyColIdx = i;
-            // 중량
-            else if (lower.includes('중량') || lower.includes('weight') || lower.includes('kg')) weightColIdx = i;
-            // 국적
-            else if (lower.includes('국적')) nationalityColIdx = i;
-            // 분류
-            else if (lower.includes('분류')) classificationColIdx = i;
-            // 특징
-            else if (lower.includes('특징') || lower.includes('마킹')) featureColIdx = i;
-            // 송장
-            else if (lower.includes('송장')) invoiceColIdx = i;
-            // 카테고리
-            else if (lower.includes('카테고리') && !lower.includes('화물')) cargoCategoryColIdx = i;
-            // 화물 설명
-            else if (lower.includes('화물') || (lower.includes('설명') && cargoCategoryColIdx !== i)) cargoDescColIdx = i;
-            // 비고
-            else if (lower.includes('비고') || lower.includes('desc') || lower.includes('memo')) descColIdx = i;
+            if (norm.includes('차수') || norm.includes('seq')) voyageSequenceColIdx = i;
+
+            // Fuzzy Header Matching(#4)
+            else if (norm.includes('no') || lower === 'no.' || lower === '#') noColIdx = i;
+            else if (norm.includes('입고') || norm.includes('date') || norm.includes('arrival')) arrivalDateColIdx = i;
+            else if (norm.includes('이름') || norm.includes('name') || norm.includes('수령')) nameColIdx = i;
+            else if (norm.includes('수량') || norm.includes('qty') || norm.includes('box') || norm.includes('count')) qtyColIdx = i;
+            else if (norm.includes('택배') || norm.includes('courier') || norm.includes('dlv')) courierColIdx = i;
+            else if (norm.includes('중량') || norm.includes('weight') || norm.includes('kg')) weightColIdx = i;
+            else if (norm.includes('국적') || norm.includes('nation') || norm.includes('country')) nationalityColIdx = i;
+            else if (norm.includes('분류') || norm.includes('class') || norm.includes('type')) classificationColIdx = i;
+            else if (norm.includes('특징') || norm.includes('feature') || norm.includes('mark')) featureColIdx = i;
+            else if (norm.includes('송장') || norm.includes('invoice') || norm.includes('inv')) invoiceColIdx = i;
+            else if (norm.includes('카테고리') || norm.includes('category') || norm.includes('cat')) cargoCategoryColIdx = i;
+            else if (norm.includes('화물') || norm.includes('내용') || norm.includes('item') || norm.includes('desc')) cargoDescColIdx = i;
+            else if (norm.includes('비고') || norm.includes('note') || norm.includes('memo') || norm.includes('remark')) descColIdx = i;
         });
     }
 
     const rows: ParsedRow[] = [];
+    const BATCH_SIZE = 50; // 📌 50행마다 UI Thread 양보
 
     for (let i = dataStartIndex; i < lines.length; i++) {
+        // 📌 Async Batching: 50행마다 UI 스레드 양보
+        if ((i - dataStartIndex) > 0 && (i - dataStartIndex) % BATCH_SIZE === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
         const cells = splitRow(lines[i]);
-        // 📌 모든 셀이 빈 경우만 건너뛰기 (빈 셀이 있어도 데이터가 있으면 처리)
+        // 📌 모든 셀이 빈 경우만 건너뛰기
         if (cells.every(c => !c)) continue;
 
         let parsedRow: ParsedRow = {
@@ -245,17 +294,18 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
         // 헤더 기반 파싱
         if (headers && (nameColIdx >= 0 || cells.length > 3)) {
             // 📌 차수 (NEW!)
-            if (voyageSequenceColIdx >= 0) parsedRow.voyageSequence = cells[voyageSequenceColIdx]?.trim();
+            if (voyageSequenceColIdx >= 0) parsedRow.voyageSequence = cells[voyageSequenceColIdx];
             // 순번
             if (noColIdx >= 0 && cells[noColIdx]) {
                 parsedRow.no = parseInt(cells[noColIdx].replace(/[^\d]/g, '')) || undefined;
             }
-            // 입고일자
-            if (arrivalDateColIdx >= 0) parsedRow.arrivalDate = cells[arrivalDateColIdx]?.trim();
+            // 입고일자 (#2 Date Chaos Fix)
+            if (arrivalDateColIdx >= 0) parsedRow.arrivalDate = parseExcelDate(cells[arrivalDateColIdx]);
+
             // 택배사
-            if (courierColIdx >= 0) parsedRow.courier = cells[courierColIdx]?.trim();
+            if (courierColIdx >= 0) parsedRow.courier = cells[courierColIdx];
             // 수령인 이름 (내용)
-            if (nameColIdx >= 0) parsedRow.rawName = cells[nameColIdx]?.trim() || '';
+            if (nameColIdx >= 0) parsedRow.rawName = cells[nameColIdx] || '';
             // 수량
             if (qtyColIdx >= 0) {
                 const qtyStr = cells[qtyColIdx]?.replace(/[^\d]/g, '');
@@ -267,24 +317,24 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
                 parsedRow.weight = parseFloat(weightStr) || undefined;
             }
             // 국적
-            if (nationalityColIdx >= 0) parsedRow.nationality = cells[nationalityColIdx]?.trim()?.toLowerCase();
+            if (nationalityColIdx >= 0) parsedRow.nationality = cells[nationalityColIdx]?.toLowerCase();
             // 분류
-            if (classificationColIdx >= 0) parsedRow.classification = cells[classificationColIdx]?.trim()?.toLowerCase();
+            if (classificationColIdx >= 0) parsedRow.classification = cells[classificationColIdx]?.toLowerCase();
             // 특징
-            if (featureColIdx >= 0) parsedRow.feature = cells[featureColIdx]?.trim();
+            if (featureColIdx >= 0) parsedRow.feature = cells[featureColIdx];
             // 송장
-            if (invoiceColIdx >= 0) parsedRow.invoice = cells[invoiceColIdx]?.trim();
+            if (invoiceColIdx >= 0) parsedRow.invoice = cells[invoiceColIdx];
             // 카테고리
-            if (cargoCategoryColIdx >= 0) parsedRow.cargoCategory = cells[cargoCategoryColIdx]?.trim();
+            if (cargoCategoryColIdx >= 0) parsedRow.cargoCategory = cells[cargoCategoryColIdx];
             // 화물 설명
-            if (cargoDescColIdx >= 0) parsedRow.cargoDesc = cells[cargoDescColIdx]?.trim();
+            if (cargoDescColIdx >= 0) parsedRow.cargoDesc = cells[cargoDescColIdx];
             // 비고
-            if (descColIdx >= 0) parsedRow.desc = cells[descColIdx]?.trim();
+            if (descColIdx >= 0) parsedRow.desc = cells[descColIdx];
 
-            // 특징에서 전화번호 추출
-            if (parsedRow.feature && !parsedRow.phone) {
-                parsedRow.phone = extractPhone(parsedRow.feature);
-            }
+            // 전화번호 추출: 특징 -> 비고 -> 화물설명 순 (#7 Hidden Phone Fix)
+            if (!parsedRow.phone && parsedRow.feature) parsedRow.phone = extractPhone(parsedRow.feature);
+            if (!parsedRow.phone && parsedRow.desc) parsedRow.phone = extractPhone(parsedRow.desc);
+            if (!parsedRow.phone && parsedRow.cargoDesc) parsedRow.phone = extractPhone(parsedRow.cargoDesc);
         }
         // 스마트 파싱 (헤더 없음)
         else {
@@ -347,12 +397,11 @@ export function parseGoogleSheetData(rawText: string): ParseResult {
             }
         }
 
-        // 비고에서 전화번호 추출
-        if (parsedRow.desc) {
-            const phone = extractPhone(parsedRow.desc);
-            if (phone) {
-                parsedRow.phone = phone;
-            }
+        // 📌 FIX: 비고 + 전체 셀에서 전화번호 재검색
+        if (!parsedRow.phone) {
+            const allText = cells.join(' ');
+            const phone = extractPhone(allText);
+            if (phone) parsedRow.phone = phone;
         }
 
         // 이름이 있는 경우만 추가

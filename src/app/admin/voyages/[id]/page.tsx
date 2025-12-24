@@ -15,8 +15,9 @@ import {
     ChevronDown, Search, FileSpreadsheet, ArrowRight, Undo2
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { parseGoogleSheetData, type ParsedRow } from '@/lib/packing-list-parser';
+import { parseGoogleSheetData } from '@/lib/packing-list-parser';
 import type {
+    ParsedRow,
     Customer, Voyage, VoyageStatus,
     MatchStatus, StagingRecord, ConflictType, ConflictResolution, SimilarCandidate
 } from '@/types';
@@ -35,7 +36,7 @@ import {
     AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 // Firestore 서비스
-import { saveCustomer, saveShipmentsBatch, updateCustomerStats, approveShipment, approveAllShipments } from '@/lib/firestore-service';
+import { saveCustomer, saveShipmentsBatch, updateCustomerStats, approveShipment, approveAllShipments, updateShipment, softDeleteShipment } from '@/lib/firestore-service';
 import { useCustomers, useShipments } from '@/hooks/use-erp-data';
 import { isFirebaseConfigured } from '@/lib/firebase';
 // Multi-Factor Matcher
@@ -186,7 +187,7 @@ const ConflictResolutionModal = ({
                                 </tr>
                             </thead>
                             <tbody>
-                                {record.conflict.fields.map((field, idx) => (
+                                {record.conflict.fields?.map((field, idx) => (
                                     <tr key={idx} className="border-t">
                                         <td className="p-2 font-medium">{field.field}</td>
                                         <td className="p-2 text-muted-foreground">{field.masterValue || '-'}</td>
@@ -299,7 +300,7 @@ const NewCustomerModal = ({
                     </DialogDescription>
                 </DialogHeader>
 
-                <div className="space-y-4">
+                <div className="space-y-4 py-4">
                     <div>
                         <Label>고객명 (Document ID) *</Label>
                         <Input
@@ -356,6 +357,90 @@ const NewCustomerModal = ({
                         <UserPlus className="w-4 h-4 mr-2" />
                         등록 및 연결
                     </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+    );
+};
+
+// =============================================================================
+// 🆕 화물 수정 모달
+// =============================================================================
+const EditShipmentDetailDialog = ({
+    isOpen,
+    onClose,
+    shipment,
+    onSave
+}: {
+    isOpen: boolean;
+    onClose: () => void;
+    shipment: any;
+    onSave: (id: string, updates: any) => Promise<void>;
+}) => {
+    const [formData, setFormData] = useState({
+        qty: 1,
+        desc: '',
+        memo: '',
+    });
+
+    useEffect(() => {
+        if (shipment) {
+            setFormData({
+                qty: shipment.qty || 1,
+                desc: shipment.description || shipment.cargoDesc || '',
+                memo: shipment.memo || shipment.feature || '',
+            });
+        }
+    }, [shipment]);
+
+    const handleSave = async () => {
+        if (!shipment) return;
+        await onSave(shipment.id, {
+            qty: Number(formData.qty),
+            description: formData.desc,
+            memo: formData.memo,
+        });
+        onClose();
+    };
+
+    if (!shipment) return null;
+
+    return (
+        <Dialog open={isOpen} onOpenChange={onClose}>
+            <DialogContent>
+                <DialogHeader>
+                    <DialogTitle>화물 정보 수정</DialogTitle>
+                    <DialogDescription>{shipment.customerName} (#{shipment.customerPodCode})</DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4 py-4">
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                            <Label>수량 (Box)</Label>
+                            <Input
+                                type="number"
+                                value={formData.qty}
+                                onChange={e => setFormData({ ...formData, qty: Number(e.target.value) })}
+                            />
+                        </div>
+                    </div>
+                    <div className="space-y-2">
+                        <Label>품목 설명</Label>
+                        <Input
+                            value={formData.desc}
+                            onChange={e => setFormData({ ...formData, desc: e.target.value })}
+                        />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>메모 / 특이사항</Label>
+                        <Textarea
+                            value={formData.memo}
+                            onChange={e => setFormData({ ...formData, memo: e.target.value })}
+                        />
+                    </div>
+                </div>
+                <DialogFooter>
+                    <Button variant="outline" onClick={onClose}>취소</Button>
+                    <Button onClick={handleSave}>저장</Button>
                 </DialogFooter>
             </DialogContent>
         </Dialog>
@@ -460,6 +545,10 @@ export default function VoyageImportPage() {
     const { shipments: importedShipments, loading: shipmentsLoading } = useShipments(voyageId);
     const [approving, setApproving] = useState(false);
 
+    // 📌 Step 3 필터 상태
+    const [shipmentStatusFilter, setShipmentStatusFilter] = useState<'ALL' | 'DRAFT' | 'APPROVED'>('ALL');
+    const [shipmentSearchTerm, setShipmentSearchTerm] = useState('');
+
     // 상태
     const [rawText, setRawText] = useState('');
     const [stagingRecords, setStagingRecords] = useState<StagingRecord[]>([]);
@@ -476,6 +565,10 @@ export default function VoyageImportPage() {
     const [newCustomerModal, setNewCustomerModal] = useState<{ isOpen: boolean; data: { name: string; phone?: string; region?: string } }>({ isOpen: false, data: { name: '' } });
     const [importConfirmModal, setImportConfirmModal] = useState(false);
     const [isImporting, setIsImporting] = useState(false);
+
+    // 🆕 화물 수정/삭제 상태
+    const [editModal, setEditModal] = useState<{ isOpen: boolean; shipment: any | null }>({ isOpen: false, shipment: null });
+    const [deleteAlert, setDeleteAlert] = useState<{ isOpen: boolean; shipmentId: string | null }>({ isOpen: false, shipmentId: null });
 
     // 다음 POD 코드
     const nextPodCode = useMemo(() => {
@@ -549,14 +642,14 @@ export default function VoyageImportPage() {
     // 데이터 파싱 (Multi-Factor Matcher 사용)
     // ==========================================================================
 
-    const handleParse = useCallback(() => {
+    const handleParse = useCallback(async () => {
         if (!rawText.trim()) {
             setStagingRecords([]);
             return;
         }
 
-        // 스마트 파서 실행
-        const parseResult = parseGoogleSheetData(rawText);
+        // 스마트 파서 실행 (📌 async)
+        const parseResult = await parseGoogleSheetData(rawText);
 
         if (!parseResult.success) {
             toast({
@@ -672,6 +765,7 @@ export default function VoyageImportPage() {
             const record: StagingRecord = {
                 stagingId: `stg-${row.rowIndex}-${Date.now()}`,
                 rowIndex: row.rowIndex,
+                parsed: row,
                 raw: {
                     name: row.rawName,
                     phone: row.phone,
@@ -863,7 +957,7 @@ export default function VoyageImportPage() {
                     matchStatus: matchResult.status,
                     matchedCustomer: matchResult.matchedCustomer,
                     similarCandidates: matchResult.similarCandidates,
-                    conflict: matchResult.conflict,
+                    conflict: undefined, // 재매칭 시 충돌 초기화
                     isSelected: matchResult.status === 'VERIFIED',
                     isResolved: matchResult.status === 'VERIFIED',
                 };
@@ -877,6 +971,7 @@ export default function VoyageImportPage() {
     // ==========================================================================
 
     const handleImport = useCallback(async () => {
+        if (isImporting) return;
         setIsImporting(true);
         try {
             // 📌 Save All 정책: 모든 레코드 저장 (UNTRACKED 포함)
@@ -884,6 +979,43 @@ export default function VoyageImportPage() {
 
             if (toImport.length === 0) {
                 toast({ variant: "destructive", title: "저장할 데이터 없음" });
+                return;
+            }
+
+            // 📌 Integrity Check: POD Code 중복 검사 (Phase 3 Check #18)
+            const podMap = new Map<number, string[]>();
+            toImport.forEach(record => {
+                if (record.matchedCustomer?.podCode) {
+                    const code = record.matchedCustomer.podCode;
+                    const name = record.matchedCustomer.name;
+                    if (!podMap.has(code)) podMap.set(code, []);
+                    podMap.get(code)?.push(name);
+                }
+            });
+
+            const duplicates: string[] = [];
+            podMap.forEach((names, code) => {
+                const uniqueNames = new Set(names);
+                if (uniqueNames.size > 1) { // 같은 POD 번호에 다른 이름이 있는 경우만 문제? 아니면 단순 중복도 문제?
+                    // Checklist implies "duplicate No. values in the list" might refer to accidental double entry or conflicting ownership
+                    // If uniqueNames.size > 1, it stands for CONFLICT (Different people same POD).
+                    // If names.length > 1, it stands for MULTIPLE PACKAGES for same POD (This is allowed!).
+
+                    // Checklist #18: "duplicate No. values in the list?"
+                    // Usually multiple boxes for same POD is normal.
+                    // But if "duplicate No." implies "Different customers claiming same No", that is a conflict.
+                    // Let's assume Conflict (= Different Names for same POD) is the risk.
+                    duplicates.push(`No.${code} (${Array.from(uniqueNames).join(', ')})`);
+                }
+            });
+
+            if (duplicates.length > 0) {
+                toast({
+                    variant: "destructive",
+                    title: "데이터 무결성 경고 (저장 차단)",
+                    description: `동일한 POD 번호를 가진 다른 고객들이 발견되었습니다:\n${duplicates.join('\n')}`,
+                    duration: 5000,
+                });
                 return;
             }
 
@@ -905,14 +1037,48 @@ export default function VoyageImportPage() {
             }
 
             // 2. shipments 컬렉션에 화물 추가
-            const shipmentsData = toImport.map(r => ({
-                customerId: r.matchedCustomer?.id || r.edited.name,
-                customerName: r.matchedCustomer?.name || r.edited.name,
-                podCode: r.matchedCustomer?.podCode || 0,
-                quantity: r.raw.quantity || 1,
-                description: r.raw.description,
-                memo: r.raw.memo,
-            }));
+            const shipmentsData = toImport.map(r => {
+                const isUntracked = r.matchStatus === 'UNTRACKED';
+                // 📌 Zone 3 Fix: 매칭 안된 건은 UNTRACKED 상태로 저장 (데이터 보존)
+                const status = isUntracked ? 'UNTRACKED' : 'DRAFT';
+
+                // 📌 Zone 3 Fix #13: Snapshot Logic (Deep Copy)
+                // 저장 시점의 고객 정보를 박제하여, 추후 고객 DB가 변경되어도 인보이스는 유지됨
+                const snapshot = r.matchedCustomer ? {
+                    customerName: r.matchedCustomer.name,
+                    customerPodCode: r.matchedCustomer.podCode,
+                    customerPhone: r.matchedCustomer.phone,
+                    customerAddress: r.matchedCustomer.addressDetail || '',
+                    customerRegion: r.matchedCustomer.region,
+                    discountRate: 0, // 추후 고객 등급별 할인율 적용 필요
+                    capturedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 }
+                } : null;
+
+                return {
+                    customerId: r.matchedCustomer?.id || r.edited.name, // UNTRACKED인 경우 edited.name 사용
+                    customerName: r.matchedCustomer?.name || r.edited.name,
+                    podCode: r.matchedCustomer?.podCode || 0,
+                    quantity: r.raw.quantity || 1,
+                    description: r.raw.description,
+                    memo: r.raw.memo,
+
+                    // 📌 New Fields
+                    status,
+                    snapshot,
+
+                    // 📌 Persist Original parsed data (Zone 1 data -> Zone 3 DB)
+                    arrivalDate: r.parsed.arrivalDate,
+                    courier: r.parsed.courier,
+                    rawName: r.parsed.rawName,
+                    weight: r.parsed.weight,
+                    nationality: r.parsed.nationality,
+                    classification: r.parsed.classification,
+                    feature: r.parsed.feature,
+                    invoice: r.parsed.invoice,
+                    cargoCategory: r.parsed.cargoCategory,
+                    cargoDesc: r.parsed.cargoDesc,
+                };
+            });
 
             if (isFirebaseConfigured) {
                 const result = await saveShipmentsBatch(voyageId, shipmentsData);
@@ -1187,6 +1353,17 @@ export default function VoyageImportPage() {
                                 // Import 확인 모달 열기
                                 setImportConfirmModal(true);
                             }}
+                            onManualRegister={(item) => {
+                                // 수동 등록 처리 (Quick Register와 동일)
+                                setNewCustomerModal({
+                                    isOpen: true,
+                                    data: {
+                                        name: item.edited.name,
+                                        phone: item.parsed.phone,
+                                        region: ''
+                                    }
+                                });
+                            }}
                             isSaving={false}
                         />
                     </CardContent>
@@ -1194,107 +1371,186 @@ export default function VoyageImportPage() {
             )}
 
             {/* 🆕 Step 3: Import된 Shipments 목록 (검토 및 승인) */}
-            {importedShipments.length > 0 && (
-                <Card>
-                    <CardHeader className="pb-3">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <CardTitle className="flex items-center gap-2">
-                                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-green-600 text-white text-xs font-bold">3</span>
-                                    Import된 화물 목록
-                                    <Badge variant="secondary">{importedShipments.length}건</Badge>
-                                </CardTitle>
-                                <CardDescription>
-                                    데이터를 검토하고 승인하세요. 승인된 화물만 CBM 측정이 가능합니다.
-                                </CardDescription>
+            {importedShipments.length > 0 && (() => {
+                // 📌 필터링 로직
+                const filteredShipments = importedShipments.filter(s => {
+                    // 상태 필터
+                    if (shipmentStatusFilter !== 'ALL' && s.status !== shipmentStatusFilter) return false;
+                    // 검색 필터
+                    if (shipmentSearchTerm.trim()) {
+                        const term = shipmentSearchTerm.toLowerCase();
+                        const name = (s.snapshot?.customerName || s.customerName || '').toLowerCase();
+                        const pod = String(s.snapshot?.customerPodCode || s.customerPodCode || '');
+                        if (!name.includes(term) && !pod.includes(term)) return false;
+                    }
+                    return true;
+                });
+
+                return (
+                    <Card>
+                        <CardHeader className="pb-3">
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <CardTitle className="flex items-center gap-2">
+                                        <span className="flex items-center justify-center w-6 h-6 rounded-full bg-green-600 text-white text-xs font-bold">3</span>
+                                        Import된 화물 목록
+                                        <Badge variant="secondary">{filteredShipments.length}/{importedShipments.length}건</Badge>
+                                    </CardTitle>
+                                    <CardDescription>
+                                        데이터를 검토하고 승인하세요. 승인된 화물만 CBM 측정이 가능합니다.
+                                    </CardDescription>
+                                </div>
+                                <div className="flex gap-2">
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={approving || importedShipments.filter(s => s.status === 'DRAFT').length === 0}
+                                        onClick={async () => {
+                                            setApproving(true);
+                                            try {
+                                                const count = await approveAllShipments(voyageId);
+                                                toast({ title: "전체 승인 완료", description: `${count}건이 승인되었습니다.` });
+                                            } catch (e) {
+                                                toast({ variant: "destructive", title: "승인 실패" });
+                                            } finally {
+                                                setApproving(false);
+                                            }
+                                        }}
+                                    >
+                                        {approving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
+                                        전체 승인 ({importedShipments.filter(s => s.status === 'DRAFT').length}건)
+                                    </Button>
+                                </div>
                             </div>
-                            <div className="flex gap-2">
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={approving || importedShipments.filter(s => s.status === 'DRAFT').length === 0}
-                                    onClick={async () => {
-                                        setApproving(true);
-                                        try {
-                                            const count = await approveAllShipments(voyageId);
-                                            toast({ title: "전체 승인 완료", description: `${count}건이 승인되었습니다.` });
-                                        } catch (e) {
-                                            toast({ variant: "destructive", title: "승인 실패" });
-                                        } finally {
-                                            setApproving(false);
-                                        }
-                                    }}
-                                >
-                                    {approving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
-                                    전체 승인 ({importedShipments.filter(s => s.status === 'DRAFT').length}건)
-                                </Button>
+
+                            {/* 📌 필터 UI */}
+                            <div className="flex items-center gap-3 mt-3 pt-3 border-t">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs text-muted-foreground">상태:</span>
+                                    <Select value={shipmentStatusFilter} onValueChange={(v) => setShipmentStatusFilter(v as any)}>
+                                        <SelectTrigger className="w-28 h-8 text-xs">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="ALL">전체</SelectItem>
+                                            <SelectItem value="DRAFT">📝 검토중</SelectItem>
+                                            <SelectItem value="APPROVED">✅ 승인됨</SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                                <div className="flex-1 relative">
+                                    <Search className="absolute left-2.5 top-1/2 transform -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                                    <Input
+                                        placeholder="고객명 또는 POD 코드 검색..."
+                                        value={shipmentSearchTerm}
+                                        onChange={(e) => setShipmentSearchTerm(e.target.value)}
+                                        className="pl-8 h-8 text-xs"
+                                    />
+                                </div>
+                                {(shipmentStatusFilter !== 'ALL' || shipmentSearchTerm) && (
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-8 text-xs"
+                                        onClick={() => {
+                                            setShipmentStatusFilter('ALL');
+                                            setShipmentSearchTerm('');
+                                        }}
+                                    >
+                                        초기화
+                                    </Button>
+                                )}
                             </div>
-                        </div>
-                    </CardHeader>
-                    <CardContent>
-                        {shipmentsLoading ? (
-                            <div className="flex items-center justify-center py-8">
-                                <Loader2 className="w-6 h-6 animate-spin text-primary" />
-                            </div>
-                        ) : (
-                            <div className="border rounded-lg overflow-hidden">
-                                <table className="w-full text-sm">
-                                    <thead className="bg-muted">
-                                        <tr>
-                                            <th className="px-3 py-2 text-left">상태</th>
-                                            <th className="px-3 py-2 text-left">고객명</th>
-                                            <th className="px-3 py-2 text-left">POD</th>
-                                            <th className="px-3 py-2 text-center">수량</th>
-                                            <th className="px-3 py-2 text-center">액션</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {importedShipments.map(shipment => (
-                                            <tr key={shipment.id} className="border-t hover:bg-muted/50">
-                                                <td className="px-3 py-2">
-                                                    {shipment.status === 'DRAFT' ? (
-                                                        <Badge variant="secondary" className="bg-yellow-100 text-yellow-800">📝 검토중</Badge>
-                                                    ) : shipment.status === 'APPROVED' ? (
-                                                        <Badge variant="secondary" className="bg-green-100 text-green-800">✅ 승인됨</Badge>
-                                                    ) : (
-                                                        <Badge variant="secondary">{shipment.status}</Badge>
-                                                    )}
-                                                </td>
-                                                <td className="px-3 py-2 font-medium">{shipment.snapshot?.customerName || shipment.customerName}</td>
-                                                <td className="px-3 py-2 text-muted-foreground">#{shipment.snapshot?.customerPodCode || shipment.customerPodCode}</td>
-                                                <td className="px-3 py-2 text-center">{shipment.quantity || 1}</td>
-                                                <td className="px-3 py-2 text-center">
-                                                    {shipment.status === 'DRAFT' && (
-                                                        <Button
-                                                            size="sm"
-                                                            variant="ghost"
-                                                            className="h-7 text-xs"
-                                                            onClick={async () => {
-                                                                try {
-                                                                    await approveShipment(shipment.id);
-                                                                    toast({ title: "승인 완료" });
-                                                                } catch (e) {
-                                                                    toast({ variant: "destructive", title: "승인 실패" });
-                                                                }
-                                                            }}
-                                                        >
-                                                            <Check className="w-3 h-3 mr-1" />
-                                                            승인
-                                                        </Button>
-                                                    )}
-                                                </td>
+                        </CardHeader>
+                        <CardContent>
+                            {shipmentsLoading ? (
+                                <div className="flex items-center justify-center py-8">
+                                    <Loader2 className="w-6 h-6 animate-spin text-primary" />
+                                </div>
+                            ) : filteredShipments.length === 0 ? (
+                                <div className="text-center py-8 text-muted-foreground">
+                                    필터에 맞는 화물이 없습니다.
+                                </div>
+                            ) : (
+                                <div className="border rounded-lg overflow-hidden">
+                                    <table className="w-full text-sm">
+                                        <thead className="bg-muted">
+                                            <tr>
+                                                <th className="px-3 py-2 text-left">상태</th>
+                                                <th className="px-3 py-2 text-left">고객명</th>
+                                                <th className="px-3 py-2 text-left">POD</th>
+                                                <th className="px-3 py-2 text-center">수량</th>
+                                                <th className="px-3 py-2 text-center">액션</th>
                                             </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
+                                        </thead>
+                                        <tbody>
+                                            {filteredShipments.map(shipment => (
+                                                <tr key={shipment.id} className="border-t hover:bg-muted/50">
+                                                    <td className="px-3 py-2">
+                                                        {shipment.status === 'DRAFT' ? (
+                                                            <Badge variant="secondary" className="bg-yellow-100 text-yellow-800">📝 검토중</Badge>
+                                                        ) : shipment.status === 'APPROVED' ? (
+                                                            <Badge variant="secondary" className="bg-green-100 text-green-800">✅ 승인됨</Badge>
+                                                        ) : (
+                                                            <Badge variant="secondary">{shipment.status}</Badge>
+                                                        )}
+                                                    </td>
+                                                    <td className="px-3 py-2 font-medium">{shipment.snapshot?.customerName || shipment.customerName}</td>
+                                                    <td className="px-3 py-2 text-muted-foreground">#{shipment.snapshot?.customerPodCode || shipment.customerPodCode}</td>
+                                                    <td className="px-3 py-2 text-center">{shipment.qty || 1}</td>
+                                                    <td className="px-3 py-2 text-center">
+                                                        {shipment.status === 'DRAFT' && (
+                                                            <Button
+                                                                size="sm"
+                                                                variant="ghost"
+                                                                className="h-7 text-xs"
+                                                                onClick={async () => {
+                                                                    try {
+                                                                        await approveShipment(shipment.id);
+                                                                        toast({ title: "승인 완료" });
+                                                                    } catch (e) {
+                                                                        toast({ variant: "destructive", title: "승인 실패" });
+                                                                    }
+                                                                }}
+                                                            >
+                                                                <Check className="w-3 h-3 mr-1" />
+                                                                승인
+                                                            </Button>
+                                                        )}
+
+                                                        {/* Edit / Delete Buttons */}
+                                                        <div className="flex items-center gap-1 justify-center mt-1">
+                                                            <Button
+                                                                size="sm"
+                                                                variant="ghost"
+                                                                className="h-6 w-6 p-0 hover:bg-slate-200"
+                                                                onClick={() => setEditModal({ isOpen: true, shipment })}
+                                                            >
+                                                                <Edit3 className="w-3 h-3 text-slate-500" />
+                                                            </Button>
+                                                            <Button
+                                                                size="sm"
+                                                                variant="ghost"
+                                                                className="h-6 w-6 p-0 hover:bg-red-100"
+                                                                onClick={() => setDeleteAlert({ isOpen: true, shipmentId: shipment.id })}
+                                                            >
+                                                                <Trash2 className="w-3 h-3 text-red-500" />
+                                                            </Button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            <div className="mt-3 text-xs text-muted-foreground">
+                                📌 DRAFT: 검토 필요 | ✅ APPROVED: CBM 측정 가능
                             </div>
-                        )}
-                        <div className="mt-3 text-xs text-muted-foreground">
-                            📌 DRAFT: 검토 필요 | ✅ APPROVED: CBM 측정 가능
-                        </div>
-                    </CardContent>
-                </Card>
-            )}
+                        </CardContent>
+                    </Card>
+                );
+            })()}
 
             {/* 모달들 */}
             <ConflictResolutionModal
@@ -1319,6 +1575,49 @@ export default function VoyageImportPage() {
                 stats={stats}
                 isLoading={isImporting}
             />
+
+            {/* 🆕 Edit Modal */}
+            <EditShipmentDetailDialog
+                isOpen={editModal.isOpen}
+                onClose={() => setEditModal({ isOpen: false, shipment: null })}
+                shipment={editModal.shipment}
+                onSave={async (id, updates) => {
+                    try {
+                        await updateShipment(id, updates);
+                        toast({ title: "수정 완료" });
+                    } catch (e) {
+                        toast({ variant: "destructive", title: "수정 실패" });
+                    }
+                }}
+            />
+
+            {/* 🆕 Delete Alert */}
+            <AlertDialog open={deleteAlert.isOpen} onOpenChange={(open) => !open && setDeleteAlert({ isOpen: false, shipmentId: null })}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>정말 삭제하시겠습니까?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            이 작업은 취소할 수 없습니다. 화물이 목록에서 제거됩니다 (Soft Delete).
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>취소</AlertDialogCancel>
+                        <AlertDialogAction onClick={async () => {
+                            if (deleteAlert.shipmentId) {
+                                try {
+                                    await softDeleteShipment(voyageId, deleteAlert.shipmentId);
+                                    toast({ title: "삭제 완료" });
+                                } catch (e) {
+                                    toast({ variant: "destructive", title: "삭제 실패" });
+                                }
+                                setDeleteAlert({ isOpen: false, shipmentId: null });
+                            }
+                        }} className="bg-red-600 hover:bg-red-700">
+                            삭제
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
         </div>
     );
 }

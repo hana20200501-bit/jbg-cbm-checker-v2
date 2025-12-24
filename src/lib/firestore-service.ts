@@ -11,9 +11,9 @@
  *   - 항차 데이터
  *   - Document ID = "2025-12-01-1" 형식
  * 
- * voyages/{voyageId}/shipments/{shipmentId}
- *   - 화물 데이터 (항차 하위)
- *   - Sub-collection으로 관리
+ * shipments/{shipmentId}
+ *   - 화물 데이터 (Root Collection)
+ *   - voyageId로 필터링하여 조회
  */
 
 import {
@@ -411,6 +411,10 @@ export async function saveShipmentsBatch(
     const errors: string[] = [];
     let savedCount = 0;
 
+    // 🛡️ Data Safety: Batch ID Generation (VC Audit Fix)
+    // Used for potential rollback or audit tracing
+    const batchId = `import_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
     // 배치 분할
     const batches: typeof shipments[] = [];
     for (let i = 0; i < shipments.length; i += BATCH_SIZE) {
@@ -432,6 +436,7 @@ export async function saveShipmentsBatch(
                     id: shipmentRef.id,
                     voyageId,
                     customerId: shipment.customerId,
+                    batchId, // 🛡️ Linked Batch ID
 
                     // ⭐⭐⭐ SNAPSHOT: 불변 고객 정보
                     snapshot: {
@@ -543,7 +548,16 @@ export async function updateShipmentCbm(
     voyageId: string,
     shipmentId: string,
     totalCbm: number,
-    boxDimensions?: { length: number; width: number; height: number; quantity: number }[]
+    boxDimensions?: {
+        length: number;
+        width: number;
+        height: number;
+        quantity: number;
+        id?: string;
+        imageUrl?: string;
+        memo?: string;
+    }[],
+    measuredBy?: string // 📌 Audit Trace
 ): Promise<void> {
     if (!db) throw new Error('Firestore not initialized');
 
@@ -554,6 +568,7 @@ export async function updateShipmentCbm(
         boxDimensions: boxDimensions || [],
         status: 'CBM_DONE' as ShipmentStatus,
         updatedAt: serverTimestamp(),
+        measuredBy: measuredBy || 'unknown', // 📌 Record who did it
     });
 
     // 항차 통계도 업데이트
@@ -623,6 +638,39 @@ export async function updateShipmentApprovalStatus(
         status,
         updatedAt: serverTimestamp(),
     });
+}
+
+/**
+ * 화물 정보 수정 (Admin)
+ */
+export async function updateShipment(
+    shipmentId: string,
+    updates: Partial<Shipment>
+): Promise<void> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+    await updateDoc(docRef, {
+        ...updates,
+        updatedAt: serverTimestamp(),
+    });
+}
+
+/**
+ * 화물 삭제 (Soft Delete)
+ */
+export async function softDeleteShipment(voyageId: string, shipmentId: string): Promise<void> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+    await updateDoc(docRef, {
+        deleted: true,
+        deletedAt: serverTimestamp(),
+        // status: 'DELETED' as any, // 필요시 상태 변경
+    });
+
+    // 항차 카운트 감소 (Denormalization)
+    await updateVoyageStats(voyageId, -1, 0, 0);
 }
 
 // =============================================================================
@@ -721,6 +769,47 @@ export function subscribeToShipments(
             callback([]); // 에러 시 빈 배열 반환
         }
     );
+}
+
+/**
+ * 단일 화물 실시간 구독
+ */
+export function subscribeToShipment(
+    shipmentId: string,
+    callback: (shipment: Shipment | null) => void
+) {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+
+    return onSnapshot(docRef,
+        (docSnap) => {
+            if (docSnap.exists()) {
+                callback(fromFirestore<Shipment>({ id: docSnap.id, ...docSnap.data() }));
+            } else {
+                callback(null);
+            }
+        },
+        (error) => {
+            console.error('Shipment subscription error:', error);
+            callback(null);
+        }
+    );
+}
+
+/**
+ * 단일 화물 조회
+ */
+export async function getShipment(shipmentId: string): Promise<Shipment | null> {
+    if (!db) throw new Error('Firestore not initialized');
+
+    const docRef = doc(db, SHIPMENT_COLLECTION, shipmentId);
+    const docSnap = await getDoc(docRef);
+
+    if (docSnap.exists()) {
+        return fromFirestore<Shipment>({ id: docSnap.id, ...docSnap.data() });
+    }
+    return null;
 }
 
 // =============================================================================
@@ -829,7 +918,7 @@ export async function saveShipmentsBatchV2(
                     podCode: record.podCode || 0,
 
                     // 상태
-                    status: 'PENDING' as ShipmentStatus,
+                    status: 'DRAFT' as ShipmentStatus, // 📌 FIX: DRAFT → 승인 필요
                     warningFlag: record.warningFlag || null,
 
                     // Audit 필드
